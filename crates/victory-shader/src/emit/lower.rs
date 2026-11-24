@@ -4034,6 +4034,17 @@ impl<'a> Lower<'a> {
             }
             _ => return Err("a scalar memory read as data"),
         };
+        // A structured buffer's size is asked through a raw handle, in bytes,
+        // and divided by its stride: the host makes structured views raw
+        // (NVIDIA addresses a structured view by its own stride), and a
+        // structured handle's size of a raw view is its dwords (shader
+        // views) or bytes (unordered views), not its elements.
+        let structured = image.is_none() && props.0 & 0xFF == 12;
+        let (props, stride) = if structured {
+            (((props.0 & !0xFF) | 11, 0), props.1)
+        } else {
+            (props, 0)
+        };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -4083,6 +4094,11 @@ impl<'a> Lower<'a> {
                 let last = self.s.m.bin(c, Bin::Shl, levels, k16);
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
                 vec![(1, d1), (2, d2), (3, d3), (4, depth)]
+            }
+            None if structured => {
+                let bytes = field(self, 0);
+                let stride = self.s.m.i32(stride);
+                vec![(2, self.s.m.bin(c, Bin::UDiv, bytes, stride))]
             }
             None => vec![(2, field(self, 0))],
         };
