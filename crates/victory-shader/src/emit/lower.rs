@@ -8116,6 +8116,15 @@ impl<'a> Lower<'a> {
         let f32t = self.s.t.f32;
         let dims_t = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
         let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        let base_dims = self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims_t, 72, &[h, zero]);
+        // Null texture views gather zero even with an opaque border. A live
+        // 2D or array view has a nonzero width and at least one mip level.
+        let width = self.s.m.extract(c, base_dims, 0);
+        let bound = self.s.m.cmp(c, pred::NE, width, zero);
+        let at = self.begin_guarded(Some(bound));
+        let c = self.cur;
         let to_f32 = |l: &mut Self, v: V| -> V {
             if *a16 {
                 l.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[v])
@@ -8144,19 +8153,19 @@ impl<'a> Lower<'a> {
             let f = self.binary(35, f, lo);
             let f = self.binary(36, f, hi);
             let l = self.s.m.cast(c, Cast::FpToSi, f, i32t);
-            let d = self
-                .s
-                .op(c, "getDimensions", Attr::ReadOnly, dims_t, 72, &[h, zero]);
-            let levels = self.s.m.extract(c, d, 3);
+            let levels = self.s.m.extract(c, base_dims, 3);
             let last = self.s.m.bin(c, Bin::Sub, levels, one);
             let past = self.s.m.cmp(c, pred::SGT, l, last);
             self.s.m.select(c, past, last, l)
         } else {
             zero
         };
-        let d = self
-            .s
-            .op(c, "getDimensions", Attr::ReadOnly, dims_t, 72, &[h, level]);
+        let d = if mip_filter {
+            self.s
+                .op(c, "getDimensions", Attr::ReadOnly, dims_t, 72, &[h, level])
+        } else {
+            base_dims
+        };
         let offset = has_offset.then(|| a[0]);
         let sizes = [
             self.s.m.extract(c, d, 0),
@@ -8249,7 +8258,8 @@ impl<'a> Lower<'a> {
                 })
                 .collect();
         }
-        for (k, x) in xs.into_iter().enumerate() {
+        let results: Vec<_> = xs.into_iter().map(|x| (x, zero)).collect();
+        for (k, x) in self.end_guarded(at, &results).into_iter().enumerate() {
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())

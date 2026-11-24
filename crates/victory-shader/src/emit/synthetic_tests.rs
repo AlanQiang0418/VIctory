@@ -799,7 +799,7 @@ fn gathers_at_a_level_address_modes_and_borders_match_reference_and_hardware() {
                 };
                 input.extend([off, u, v, lword]);
             }
-            let views = [
+            let mut views = [
                 View::Mipped(16, 8, 4, &texels),
                 View::Buffer {
                     data: &input,
@@ -808,19 +808,31 @@ fn gathers_at_a_level_address_modes_and_borders_match_reference_and_hardware() {
                 View::RawUav(32 * 12),
             ];
             let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
-            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-            let out = host
-                .dispatch(
+            let dispatch = |views: &[View]| {
+                let ud = vec![0; shader.user_data_dwords().max(1) as usize];
+                host.dispatch(
                     &root,
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &views,
+                        views,
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
                 )
-                .unwrap_or_else(|e| panic!("{backend}/{label}: dispatch failed: {e}"));
+                .unwrap_or_else(|e| panic!("{backend}/{label}: dispatch failed: {e}"))
+            };
+            let out = dispatch(&views);
+            // Same sampler and coordinates, with a null SRV: both emulated
+            // gathers and the native level-zero gather must read zero.
+            views[0] = View::NullTexture2D;
+            let null = dispatch(&views);
+            for lane in 0..records.len() {
+                assert_eq!(
+                    &null[0][lane * 12..][..12], [0; 12],
+                    "{backend}/{label}: null texture, lane {lane}"
+                );
+            }
             let ch = dmask.trailing_zeros() as usize;
             let sext = |b: u32| i64::from((b as i32) << 26 >> 26);
             for (lane, &[offset, u_bits, v_bits, raw_lvl]) in records.iter().enumerate() {
