@@ -1212,10 +1212,34 @@ pub(crate) fn take_counts() -> (u64, u64) {
     (DRAWS.swap(0, Relaxed), DISPATCHES.swap(0, Relaxed))
 }
 
-/// A GPU wait for a memory value `(address, comparison, reference, ...)`.
-/// Lists run one after another and to completion, so a value another queue
-/// or the CPU has to write first cannot be waited for; nothing to do.
-extern "system" fn wait_value(_: This, _address: u64, _comparison: u32, _reference: u64) {}
+/// GPU waits for a memory value: `Wait32BitValueX(address, comparison,
+/// value, mask, flags)` and `Wait64BitValueX(address, comparison, value,
+/// flags)`, which compares the whole word (what follows the value is no
+/// mask). The list is held back at submission until the wait is over
+/// ([`crate::queue::held`]).
+extern "system" fn wait32(this: This, address: u64, comparison: u32, value: u32, mask: u32) {
+    defer_wait(this, address, 4, comparison, u64::from(value), u64::from(mask));
+}
+extern "system" fn wait64(this: This, address: u64, comparison: u32, value: u64) {
+    defer_wait(this, address, 8, comparison, value, u64::MAX);
+}
+
+fn defer_wait(this: This, address: u64, bytes: usize, comparison: u32, reference: u64, mask: u64) {
+    #[cfg(windows)]
+    if address != 0
+        && let Some(list) = host_list(this)
+    {
+        list.defer_wait(crate::queue::Wait {
+            address,
+            bytes,
+            comparison,
+            reference,
+            mask,
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = (this, address, bytes, comparison, reference, mask);
+}
 
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
@@ -1318,8 +1342,8 @@ const METHODS: [(usize, *const ()); 52] = [
     (68, ignored_state as *const ()),             // 0x220 depth bounds
     (69, write32 as *const ()),                   // 0x228
     (70, write64 as *const ()),                   // 0x230
-    (71, wait_value as *const ()),                // 0x238, 32 bits
-    (72, wait_value as *const ()),                // 0x240, 64 bits
+    (71, wait32 as *const ()),                    // 0x238
+    (72, wait64 as *const ()),                    // 0x240
     (73, ignored_state as *const ()),             // 0x248 pixel shader depth order
     (83, copy_texture_region_x as *const ()),     // 0x298
     (84, copy_resource_x as *const ()),           // 0x2a0
@@ -1433,5 +1457,112 @@ mod tests {
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    /// #700: a producer list writes a payload and then a counter; a
+    /// consumer list on another queue waits for the counter and copies the
+    /// payload. Whichever is submitted first, the copy sees the payload, and
+    /// a signal after the consumer comes only once it has run.
+    #[test]
+    #[cfg(windows)]
+    fn a_list_waiting_for_a_value_runs_once_it_is_written() {
+        if crate::host::host().is_none() {
+            eprintln!("no host GPU; skipped");
+            return;
+        }
+        let null = std::ptr::null();
+        let release = |o: This| object::release_ref(o);
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let new_list = || {
+            let mut list = null;
+            let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
+            assert_eq!(hr, S_OK);
+            list
+        };
+        let desc = crate::queue::QueueDesc::default();
+        let new_queue = || {
+            let mut q = null;
+            assert_eq!(crate::queue::create(null, &desc, &crate::queue::QUEUE_IIDS[0], &mut q), S_OK);
+            q
+        };
+        const PAYLOAD: u64 = 0x5a55_a11c;
+        // 0: consumer first, 1: producer first, 2: both in one submission.
+        for order in 0..3 {
+            // Payload, counter, result.
+            let words = Box::new([0u64; 3]);
+            let at = |i: usize| (&raw const words[i]) as u64;
+            let (producer, consumer) = (new_list(), new_list());
+            write64(producer, at(0), PAYLOAD, 0, 0);
+            write64(producer, at(1), 2, 0, 0);
+            assert_eq!(close(producer), S_OK);
+            wait64(consumer, at(1), 7, 1); // GREATER_EQUAL
+            copy_memory(consumer, at(2), at(0), 8, 0);
+            assert_eq!(close(consumer), S_OK);
+            let (a, b) = (new_queue(), new_queue());
+            let mut fence = null;
+            let fence_iid = &crate::fence::FENCE_IIDS[0];
+            assert_eq!(crate::fence::create(null, 0, 0, fence_iid, &mut fence), S_OK);
+            let completed = || slot::<extern "system" fn(This) -> u64>(fence, 0x40)(fence);
+            match order {
+                0 => {
+                    crate::queue::execute(b, 1, &consumer);
+                    assert_eq!(crate::queue::signal(b, fence, 1), S_OK);
+                    assert!(crate::queue::held::holds(b), "the consumer waits");
+                    assert_eq!((words[2], completed()), (0, 0), "nothing ran yet");
+                    crate::queue::execute(a, 1, &producer);
+                }
+                1 => {
+                    crate::queue::execute(a, 1, &producer);
+                    crate::queue::execute(b, 1, &consumer);
+                    assert_eq!(crate::queue::signal(b, fence, 1), S_OK);
+                }
+                _ => {
+                    let both = [producer, consumer];
+                    crate::queue::execute(b, 2, both.as_ptr());
+                    assert_eq!(crate::queue::signal(b, fence, 1), S_OK);
+                }
+            }
+            assert!(!crate::queue::held::holds(b), "order {order}");
+            assert_eq!(words[1], 2, "order {order}");
+            assert_eq!(words[2], PAYLOAD, "order {order}");
+            assert_eq!(completed(), 1, "order {order}");
+            for o in [producer, consumer, a, b, fence] {
+                release(o);
+            }
+        }
+        release(allocator);
+    }
+
+    /// A wait that never ends holds its queue for 2 s, not for ever.
+    #[test]
+    #[cfg(windows)]
+    fn a_wait_that_never_ends_gives_up() {
+        if crate::host::host().is_none() {
+            eprintln!("no host GPU; skipped");
+            return;
+        }
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator), S_OK);
+        let mut list = null;
+        let hr = create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list);
+        assert_eq!(hr, S_OK);
+        let word = Box::new(0u64);
+        wait64(list, (&raw const *word) as u64, 1, 0); // NEVER
+        assert_eq!(close(list), S_OK);
+        let mut q = null;
+        let desc = crate::queue::QueueDesc::default();
+        assert_eq!(crate::queue::create(null, &desc, &crate::queue::QUEUE_IIDS[0], &mut q), S_OK);
+        crate::queue::execute(q, 1, &list);
+        assert!(crate::queue::held::holds(q));
+        let started = std::time::Instant::now();
+        while crate::queue::held::holds(q) && started.elapsed().as_secs() < 4 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!crate::queue::held::holds(q), "still held after {:?}", started.elapsed());
+        for o in [list, q, allocator] {
+            object::release_ref(o);
+        }
     }
 }

@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, QUEUE, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
-const QUEUE_IIDS: [Iid; 4] = [
+pub(crate) const QUEUE_IIDS: [Iid; 4] = [
     guid(
         0x0ec870a6,
         0x5d7e,
@@ -20,7 +20,7 @@ const QUEUE_IIDS: [Iid; 4] = [
 ];
 
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct QueueDesc {
     kind: u32,
     priority: i32,
@@ -110,25 +110,261 @@ extern "system" fn release(this: This) -> u32 {
     object::release_boxed::<Queue>(this)
 }
 
-/// Runs the lists' host lists and waits for them (decision 0007).
-extern "system" fn execute(_: This, count: u32, lists: *const This) {
+/// Runs the lists' host lists and waits for them (decision 0007), unless
+/// one waits for a memory value no submission has written yet; that list
+/// and what follows it on this queue are held back ([`held`]).
+pub(crate) extern "system" fn execute(this: This, count: u32, lists: *const This) {
     if lists.is_null() {
         return;
     }
     #[cfg(windows)]
-    if let Some(host) = crate::host::host() {
+    if crate::host::host().is_some() {
         // SAFETY: the title passes `count` lists.
         let lists = unsafe { std::slice::from_raw_parts(lists, count as usize) };
-        let host_lists: Vec<_> = lists
-            .iter()
-            .filter_map(|&l| crate::list::host_list(l))
-            .collect();
-        host.execute(&host_lists);
+        held::submit(this, held::Held::Lists(lists.iter().map(|&l| l as usize).collect()));
         return;
     }
+    let _ = this;
     static ONCE: AtomicBool = AtomicBool::new(false);
     if !ONCE.swap(true, Ordering::Relaxed) {
         tracing::warn!(count, "command lists submitted; no host GPU runs them");
+    }
+}
+
+/// A list's GPU wait for a memory value (`Wait32BitValueX`,
+/// `Wait64BitValueX`): over once `(value & mask) <comparison> reference`,
+/// the comparison a `D3D12_COMPARISON_FUNC` (as AMD's `WAIT_REG_MEM`).
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Wait {
+    pub(crate) address: u64,
+    /// 4 or 8.
+    pub(crate) bytes: usize,
+    pub(crate) comparison: u32,
+    pub(crate) reference: u64,
+    pub(crate) mask: u64,
+}
+
+#[cfg(windows)]
+impl Wait {
+    /// Whether the wait is over now. Memory that is not committed and
+    /// comparisons we do not know end it, rather than hold a queue forever.
+    pub(crate) fn met(&self) -> bool {
+        if !crate::texture::committed(self.address as *const u8, self.bytes) {
+            return true;
+        }
+        // SAFETY: committed title memory, `bytes` long.
+        let value = unsafe {
+            if self.bytes == 4 {
+                u64::from((self.address as *const u32).read_volatile())
+            } else {
+                (self.address as *const u64).read_volatile()
+            }
+        };
+        let (v, r) = (value & self.mask, self.reference);
+        match self.comparison {
+            1 => false,
+            2 => v < r,
+            3 => v == r,
+            4 => v <= r,
+            5 => v > r,
+            6 => v != r,
+            7 => v >= r,
+            _ => true,
+        }
+    }
+}
+
+/// Work held back on queues behind a list that waits for a memory value
+/// (#700): lists run one submission after another, and a value another
+/// queue or the CPU writes later cannot be waited for inside one. So a
+/// submission runs up to its first list whose wait is not over yet; that
+/// list, the rest of the submission and every later submission and signal
+/// on the same queue wait in order, without blocking the title's thread.
+/// They run as soon as the wait is over: at any submission or signal, and
+/// every millisecond while anything is held (for values the CPU writes).
+///
+/// shortcut: a list waits as a whole, so its commands before the wait wait
+/// too (they would deadlock only if what the wait needs depended on them).
+/// Presents and page mappings on a queue holding work do not wait for it.
+#[cfg(windows)]
+pub(crate) mod held {
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use crate::object::{self, This};
+
+    /// A wait not over after this long is taken as over: a title would
+    /// hang on the console too, but here it more likely means a value we do
+    /// not model (a write on a path we do not see).
+    const GIVE_UP: Duration = Duration::from_secs(2);
+
+    /// A queue's work, objects as addresses (held ones with a reference).
+    pub(crate) enum Held {
+        Lists(Vec<usize>),
+        Signal(usize, u64),
+    }
+
+    struct Queue {
+        queue: usize,
+        /// Since the first held item last moved.
+        since: Instant,
+        held: VecDeque<Held>,
+    }
+
+    static HELD: Mutex<Vec<Queue>> = Mutex::new(Vec::new());
+    /// The thread that retries held work while there is any.
+    static RETRYING: AtomicBool = AtomicBool::new(false);
+
+    /// Runs `work` for `queue`, or holds it back behind what the queue
+    /// already holds or behind a wait in it.
+    pub(crate) fn submit(queue: This, work: Held) {
+        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        let queue = queue as usize;
+        match held.iter_mut().find(|q| q.queue == queue) {
+            Some(q) => {
+                keep(&work);
+                q.held.push_back(work);
+            }
+            None => {
+                let rest = run(work, false);
+                if let Some(rest) = rest {
+                    keep(&rest);
+                    held.push(Queue {
+                        queue,
+                        since: Instant::now(),
+                        held: VecDeque::from([rest]),
+                    });
+                }
+            }
+        }
+        retry(&mut held);
+        if !held.is_empty() && !RETRYING.swap(true, Ordering::AcqRel) {
+            std::thread::spawn(retry_while_held);
+        }
+    }
+
+    /// Whether `queue` holds work (for tests).
+    #[cfg(test)]
+    pub(crate) fn holds(queue: This) -> bool {
+        let held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        held.iter().any(|q| q.queue == queue as usize)
+    }
+
+    fn retry_while_held() {
+        loop {
+            std::thread::sleep(Duration::from_millis(1));
+            let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+            retry(&mut held);
+            if held.is_empty() {
+                RETRYING.store(false, Ordering::Release);
+                return;
+            }
+        }
+    }
+
+    /// Runs what has become ready on every queue, until nothing moves (one
+    /// queue's lists may end another's wait).
+    fn retry(held: &mut Vec<Queue>) {
+        let mut moved = true;
+        while moved {
+            moved = false;
+            for q in held.iter_mut() {
+                while let Some(work) = q.held.pop_front() {
+                    let late = q.since.elapsed() > GIVE_UP;
+                    let before = count(&work);
+                    let rest = run_kept(work, late);
+                    let after = rest.as_ref().map_or(0, count);
+                    if let Some(rest) = rest {
+                        q.held.push_front(rest);
+                    }
+                    if after == before {
+                        break;
+                    }
+                    moved = true;
+                    q.since = Instant::now();
+                }
+            }
+            held.retain(|q| !q.held.is_empty());
+        }
+    }
+
+    fn count(work: &Held) -> usize {
+        match work {
+            Held::Lists(lists) => lists.len(),
+            Held::Signal(..) => 1,
+        }
+    }
+
+    /// Takes a reference to what `work` names while it is held.
+    fn keep(work: &Held) {
+        match work {
+            Held::Lists(lists) => lists.iter().for_each(|&l| {
+                object::add_ref(l as This);
+            }),
+            Held::Signal(fence, _) => {
+                object::add_ref(*fence as This);
+            }
+        }
+    }
+
+    fn drop_kept(objects: &[usize]) {
+        for &o in objects {
+            object::release_ref(o as This);
+        }
+    }
+
+    /// [`run`] for held work: the references taken for what ran go.
+    fn run_kept(work: Held, late: bool) -> Option<Held> {
+        let all: Vec<usize> = match &work {
+            Held::Lists(lists) => lists.clone(),
+            Held::Signal(fence, _) => vec![*fence],
+        };
+        let rest = run(work, late);
+        let left = rest.as_ref().map_or(0, count);
+        drop_kept(&all[..all.len() - left]);
+        rest
+    }
+
+    /// Runs `work` up to its first list whose wait is not over (all of it
+    /// when `late`); what is left.
+    fn run(work: Held, late: bool) -> Option<Held> {
+        match work {
+            Held::Signal(fence, value) => {
+                crate::fence::signal(fence as This, value);
+                None
+            }
+            Held::Lists(lists) => {
+                let ready = if late {
+                    lists.len()
+                } else {
+                    lists
+                        .iter()
+                        .position(|&l| {
+                            crate::list::host_list(l as This).is_some_and(|h| !h.waits_over())
+                        })
+                        .unwrap_or(lists.len())
+                };
+                if late {
+                    tracing::warn!(
+                        lists = lists.len(),
+                        "a list's memory wait not over after 2 s; running it anyway"
+                    );
+                }
+                if ready > 0
+                    && let Some(host) = crate::host::host()
+                {
+                    let runs: Vec<_> = lists[..ready]
+                        .iter()
+                        .filter_map(|&l| crate::list::host_list(l as This))
+                        .collect();
+                    host.execute(&runs);
+                }
+                (ready < lists.len()).then(|| Held::Lists(lists[ready..].to_vec()))
+            }
+        }
     }
 }
 
@@ -157,10 +393,17 @@ extern "system" fn signal2_x(
 }
 /// Markers and events only matter to profilers.
 extern "system" fn marker(_: This) {}
-extern "system" fn signal(_: This, fence: This, value: u64) -> HRESULT {
+/// Signals at once, or after the work the queue holds back ([`held`]).
+pub(crate) extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
     if fence.is_null() {
         return E_INVALIDARG;
     }
+    #[cfg(windows)]
+    if crate::host::host().is_some() {
+        held::submit(this, held::Held::Signal(fence as usize, value));
+        return S_OK;
+    }
+    let _ = this;
     crate::fence::signal(fence, value)
 }
 /// Nothing runs on the queue, so waiting for a fence never blocks it.
@@ -543,5 +786,35 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn memory_waits_compare_as_d3d12_does() {
+        let word = Box::new(0x1_0000_0005u64);
+        let wait = |bytes, comparison, reference, mask| Wait {
+            address: (&raw const *word) as u64,
+            bytes,
+            comparison,
+            reference,
+            mask,
+        };
+        // The whole word against 0x1_0000_0005.
+        let full = u64::MAX;
+        assert!(wait(8, 7, 0x1_0000_0005, full).met(), "greater or equal");
+        assert!(!wait(8, 7, 0x1_0000_0006, full).met());
+        assert!(wait(8, 3, 0x1_0000_0005, full).met(), "equal");
+        assert!(wait(8, 2, 0x1_0000_0006, full).met(), "less");
+        assert!(!wait(8, 5, 0x1_0000_0005, full).met(), "greater");
+        assert!(!wait(8, 1, 0, full).met(), "never");
+        assert!(wait(8, 8, 0, full).met(), "always");
+        assert!(wait(8, 0, 0, full).met(), "unknown comparisons end the wait");
+        // The low dword, masked.
+        assert!(wait(4, 3, 5, full).met());
+        assert!(wait(4, 3, 4, 4).met());
+        // Memory that is not there ends the wait.
+        let mut gone = wait(8, 1, 0, full);
+        gone.address = 0x10;
+        assert!(gone.met());
     }
 }

@@ -357,6 +357,16 @@ pub(crate) const fn missing_table<const KIND: usize, const N: usize>() -> [*cons
     table
 }
 
+/// Drops a reference through the object's own `Release`, which frees it
+/// at the last one.
+pub(crate) fn release_ref(object: This) -> u32 {
+    // SAFETY: `object` is ours; slot 2 of every table is `Release`.
+    let f = unsafe { *(*object).functions.add(2) };
+    // SAFETY: `Release` takes the object and returns the count.
+    let release: extern "system" fn(This) -> u32 = unsafe { std::mem::transmute(f) };
+    release(object)
+}
+
 #[cfg(test)]
 pub(crate) fn slot<F: Copy>(object: This, offset: usize) -> F {
     // SAFETY: `object` is ours and its table has the slot.

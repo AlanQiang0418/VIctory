@@ -407,6 +407,8 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Memory values the list waits for before it runs.
+    waits: Vec<crate::queue::Wait>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -1061,6 +1063,27 @@ impl HostList {
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
     pub(crate) fn defer_write(&self, dst: *mut u8, what: crate::queue::Written, bytes: usize) {
         self.deferred().writes.push((dst as usize, what, bytes));
+    }
+
+    /// Holds the list back until `wait` is over. A wait for a value the list
+    /// itself writes before it is over in the list's own order; ours lands
+    /// only after the list has run, so it is not waited for.
+    pub(crate) fn defer_wait(&self, wait: crate::queue::Wait) {
+        let mut deferred = self.deferred();
+        let (start, end) = (wait.address as usize, wait.address as usize + wait.bytes);
+        if deferred
+            .writes
+            .iter()
+            .any(|&(at, _, bytes)| at < end && start < at + bytes)
+        {
+            return;
+        }
+        deferred.waits.push(wait);
+    }
+
+    /// Whether every wait of the list is over.
+    pub(crate) fn waits_over(&self) -> bool {
+        self.deferred().waits.iter().all(crate::queue::Wait::met)
     }
 
     /// A mapped upload buffer of `size` bytes, alive until the list is
