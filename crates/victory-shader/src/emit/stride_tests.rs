@@ -224,6 +224,118 @@ fn build(
 }
 
 #[test]
+fn table_buffer_descriptor_word_two_counts_records() {
+    use Stride::{Raw, Structured, Typed};
+
+    // Each program consumes dword 2 of the first descriptor and also uses that
+    // descriptor for a memory access. Store the count and the accessed value
+    // in the second view so both uses survive translation.
+    let data: Vec<u32> = (0..48).map(|i| (100.0f32 + i as f32).to_bits()).collect();
+    let indexed = [0x7E06_0281, 0xE030_2000, 0x8002_0203]; // load v2, index 1
+    let offset = [0x7E06_028C, 0xE030_1000, 0x8002_0203]; // load v2, byte 12
+    let scalar = [0xF420_0504, 0xFA00_000C, 0xBF8C_C07F, 0x7E04_0214]; // s_buffer_load at 12
+    let typed = [0x7E06_0281, 0xE000_2000, 0x8002_0203]; // load_format_x v2, index 1
+    // Write 42 to the first dword of record 1, by index or byte offset.
+    let indexed_store = [0x7E04_02AA, 0x7E06_0281, 0xE070_2000, 0x8002_0203];
+    let offset_store = [0x7E04_02AA, 0x7E06_028C, 0xE070_1000, 0x8002_0203];
+    // The same 192 bytes hold 16 records at stride 12 or 12 RGBA32F texels.
+    // Each row names the access, host view, whether it is writable, count and value.
+    let structured = Structured(12);
+    let cases = [
+        ("indexed SRV", &indexed[..], Structured(4), false, [48, data[1]]),
+        ("offset SRV", &offset[..], structured, false, [16, data[3]]),
+        ("scalar SRV", &scalar[..], structured, false, [16, data[3]]),
+        ("raw SRV", &offset[..], Raw, false, [192, data[3]]),
+        ("typed SRV", &typed[..], Typed, false, [12, data[4]]),
+        ("indexed UAV", &indexed_store[..], structured, true, [16, 42]),
+        ("offset UAV", &offset_store[..], structured, true, [16, 42]),
+    ];
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let hosts: Vec<_> = [("hardware", false), ("warp", true)]
+        .into_iter()
+        .filter_map(|(label, warp)| Host::new(warp).ok().map(|h| (label, h)))
+        .collect();
+    assert!(!hosts.is_empty(), "no SM 6.6 device");
+    let mut failures = Vec::new();
+    for (name, access, view, uav, [count, value]) in cases {
+        let mut words = vec![
+            0xBE84_0300,
+            0xBE85_0380, // s[4:5] = table
+            0xF408_0202,
+            0xFA00_0000, // s[8:11] = first descriptor
+            0xF408_0402,
+            0xFA00_0020, // s[16:19] = output descriptor
+            0xBF8C_C07F,
+            0x7E02_020A, // v1 = s10, the record count in the first descriptor
+        ];
+        words.extend_from_slice(access);
+        words.extend([
+            0xBF8C_3F70,
+            0xE070_1000,
+            0x8004_0100, // store count at byte 0 (one lane, v0 = 0)
+            0xE070_1004,
+            0x8004_0200, // store v2 at byte 4
+            0xBF81_0000,
+        ]);
+        let kind = if uav { ResourceType::Uav } else { ResourceType::Srv };
+        let mut source = entry(kind, 4, 0);
+        source.stride = match view {
+            Stride::Structured(bytes) => bytes,
+            Stride::Typed => 16,
+            _ => 0,
+        };
+        let mut output = entry(ResourceType::Uav, 4, 0);
+        output.table_offset_dwords = 8;
+        let shader = build(
+            &words,
+            vec![param(RootType::Table, 0)],
+            vec![source, output],
+            1,
+        );
+        let input = if uav {
+            View::RawUav(48)
+        } else {
+            View::Buffer {
+                data: &data,
+                stride: view,
+            }
+        };
+        let views = [input, View::RawUav(2)];
+        for (label, host) in &hosts {
+            let (root, pso) = host.compute_pipeline(&shader).unwrap();
+            let ud = vec![0; shader.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap();
+            let result = out.last().unwrap();
+            if result != &[count, value] {
+                failures.push(format!(
+                    "{label} {name}: got {result:?}, expected [{count}, {value}]"
+                ));
+            }
+            if uav && out[0][3] != value {
+                failures.push(format!(
+                    "{label} {name}: stored {}, expected {value} at byte 12",
+                    out[0][3]
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}
+
+#[test]
 fn a_heap_buffer_read_by_element_takes_the_views_stride() {
     let shader = build(
         HEAP_ELEMENT_WAVE32,
