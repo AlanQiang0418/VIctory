@@ -20,7 +20,7 @@ pub(crate) struct HostHeap {
     /// Slots mirroring the title's; view heaps have `dynamic` more.
     count: u32,
     /// Dynamic slots past `count` (none in sampler heaps): [`DYNAMIC`]
-    /// where the host takes them, else [`MIN_DYNAMIC`].
+    /// where the host takes them, else [`MIN_DYNAMIC`], with room for null views.
     dynamic: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
@@ -158,11 +158,23 @@ impl HostHeap {
                 host.device.GetDescriptorHandleIncrementSize(kind),
             )
         };
-        tracing::debug!(count, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let (gpu, total) = unsafe {
             (heap.GetGPUDescriptorHandleForHeapStart().ptr, heap.GetDesc().NumDescriptors)
         };
+        let null = victory_shader::emit::null_buffer_view();
+        // Even a successful allocation can put the end of the dynamic range
+        // in the final three slots. Keep the minimum dynamic range and leave
+        // the null UAV, null SRV and clamp slot outside it.
+        let (count, extra) = if !sampler && total == views {
+            let end = null - 1;
+            let count = count.min(end - MIN_DYNAMIC);
+            (count, extra.min(end - count))
+        } else {
+            (count, extra)
+        };
+        tracing::debug!(count, sampler, "host descriptor heap");
+        let has_null_buffers = !sampler && null > count + extra && null < total;
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
             u64::from(total) * u64::from(step),
@@ -180,10 +192,7 @@ impl HostHeap {
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; extra as usize])),
             pairs: Mutex::new((count + extra, Vec::new())),
-            pairs_end: match victory_shader::emit::null_buffer_view() {
-                null if !sampler && null > count + extra && null < total => null - 1,
-                _ => total,
-            },
+            pairs_end: if has_null_buffers { null - 1 } else { total },
             strides,
             addresses: std::sync::OnceLock::new(),
             viewed: Default::default(),
@@ -203,8 +212,7 @@ impl HostHeap {
         // What shaders read instead of a slot without a buffer view where
         // they take one at a computed index (`victory_shader::emit`, "Buffer
         // views at computed heap indices"): a null raw SRV, and UAV below it.
-        let null = victory_shader::emit::null_buffer_view();
-        if !sampler && null > count + extra && null < total {
+        if has_null_buffers {
             h.raw_view_at(null, None, 0, 0, false);
             h.raw_view_at(null - 1, None, 0, 0, true);
         } else if !sampler {
@@ -1427,6 +1435,37 @@ mod tests {
         assert!(heap.count + heap.dynamic < null, "room for the null buffer views");
         assert_eq!(heap.pairs_end, null - 1, "host copies' pairs stop below them");
         assert_eq!(null + 2, views, "the clamped index past them");
+    }
+
+    /// Either dynamic range can fit the cap exactly, including the three
+    /// slots the shader needs to stay null.
+    #[test]
+    fn null_buffer_views_survive_a_dynamic_range_ending_at_the_cap() {
+        let views = victory_shader::emit::heap_views();
+        if views != victory_shader::emit::HEAP_VIEWS_PORTABLE || host().is_none() {
+            return;
+        }
+        let null = victory_shader::emit::null_buffer_view();
+        for dynamic in [DYNAMIC, MIN_DYNAMIC] {
+            let requested = views - dynamic;
+            let heap = HostHeap::new(false, requested).expect("view heap");
+            // SAFETY: a plain query of a live heap.
+            if unsafe { heap.heap.GetDesc().NumDescriptors } != views {
+                continue;
+            }
+            assert_eq!(
+                heap.count + heap.dynamic,
+                null - 1,
+                "title requested {requested}"
+            );
+            assert_eq!(heap.pairs_end, null - 1, "title requested {requested}");
+            let (_, data) = heap.strides.as_ref().expect("view strides");
+            // SAFETY: the final three slots lie inside the mapped stride table.
+            let strides = [null - 1, null, null + 1].map(|slot| unsafe {
+                (*data as *const u32).add(slot as usize).read_volatile()
+            });
+            assert_eq!(strides, [4, 4, 0], "title requested {requested}");
+        }
     }
 
     /// Dynamic slots stay taken until given back, and runs do not wrap.
