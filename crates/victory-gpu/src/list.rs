@@ -482,8 +482,8 @@ pub(crate) struct CopyLocation {
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
-/// buffer filled at submission. Texture to buffer (read back) is not done
-/// yet.
+/// buffer filled at submission; texture to buffer (read back) through a
+/// host buffer put into title memory once the list has run.
 extern "system" fn copy_texture_region(
     this: This,
     dst: *const CopyLocation,
@@ -507,8 +507,8 @@ extern "system" fn copy_texture_region(
             return;
         };
         let Some(to) = crate::resource::host_resource(dst.resource) else {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!("texture to buffer copies not implemented"));
+            let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+            copy_texture_to_buffer(list, dst, [x, y, z], src, host_box);
             return;
         };
         let mut from = src;
@@ -590,6 +590,90 @@ extern "system" fn copy_texture_region(
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
+}
+
+/// A title texture into a title buffer (a placed footprint), as titles
+/// read back what the GPU drew. The host texture is copied into a host
+/// buffer laid out as the footprint, at offset 0 (the host wants 512-byte
+/// aligned footprints; the title's may not be). That buffer starts as the
+/// title's bytes at submission, so the copy changes only its rows (pitch
+/// padding keeps the title's bytes), and goes into title memory once the
+/// list has run.
+///
+/// shortcut: later work of the same submission that reads the buffer on
+/// the GPU sees its bytes from before the copy: the title's copy of it on
+/// the host is only refreshed from title memory. Titles read back for the
+/// CPU, after a fence.
+#[cfg(windows)]
+fn copy_texture_to_buffer(
+    list: &crate::host::HostList,
+    dst: CopyLocation,
+    at: [u32; 3],
+    src: CopyLocation,
+    source_box: Option<*const windows::Win32::Graphics::Direct3D12::D3D12_BOX>,
+) {
+    use windows::core::Interface;
+    const FOOTPRINT: u32 = 1;
+    if dst.kind != FOOTPRINT || src.kind == FOOTPRINT {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::warn!(
+                dst = dst.kind,
+                src = src.kind,
+                "copy between locations that are not textures"
+            )
+        });
+        return;
+    }
+    let (Some(host), Some(texture), Some(bytes)) = (
+        crate::host::host(),
+        crate::resource::host_resource(src.resource),
+        dst.footprint.bytes(),
+    ) else {
+        return;
+    };
+    let Some(title) = buffer_range(dst.resource, dst.footprint.offset, bytes) else {
+        return;
+    };
+    let Some((buffer, data)) = host.shared_buffer(bytes) else {
+        return;
+    };
+    crate::host::name(&buffer, || format!("list read back {bytes:#x}"));
+    list.keep(&buffer);
+    list.defer_fill(data, title, bytes as usize);
+    if crate::texture::title_written(texture) {
+        crate::texture::upload(list, src.resource, texture);
+    }
+    ensure_state(list, src.resource, COPY_SOURCE);
+    let (mut to, mut from) = (dst, src);
+    to.resource = buffer.as_raw().cast_const().cast();
+    to.footprint.offset = 0;
+    from.resource = texture.as_raw().cast_const().cast();
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| {
+        format!(
+            "read back {:?} into {:?}+{:#x} ({bytes:#x} bytes) at {at:?} box {:?}",
+            src.resource,
+            dst.resource,
+            dst.footprint.offset,
+            // SAFETY: the title's box or null.
+            source_box.map(|b| unsafe { *b })
+        )
+    });
+    // SAFETY: an open list; both locations in the host's layout, naming
+    // live resources (the buffer kept until the list is reset); the box is
+    // the title's (same layout).
+    unsafe {
+        list.list.CopyTextureRegion(
+            (&raw const to).cast(),
+            at[0],
+            at[1],
+            at[2],
+            (&raw const from).cast(),
+            source_box,
+        )
+    };
+    list.defer_readback(title, data, bytes as usize);
 }
 
 #[allow(clippy::too_many_arguments)] // the method's own arguments

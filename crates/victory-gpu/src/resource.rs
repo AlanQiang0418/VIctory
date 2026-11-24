@@ -1783,6 +1783,125 @@ mod tests {
         }
     }
 
+    /// A title buffer copied into a texture and the texture back into
+    /// another title buffer, through our list and queue: the rows land at
+    /// a footprint offset the host could not take directly (not 512-byte
+    /// aligned), and the bytes around them stay the title's.
+    #[cfg(windows)]
+    #[test]
+    fn texture_data_reaches_the_title_buffer() {
+        if crate::host::host().is_none() {
+            return; // no host GPU here
+        }
+        let null = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        const COPY_DEST: u32 = 0x400;
+        let (mut image, mut source, mut target) = (null, null, null);
+        for (out, desc, state) in [
+            (&mut image, texture(4, 4, 28, 1), COPY_DEST),
+            (&mut source, buffer(1024), 0),
+            (&mut target, buffer(2048), 0),
+        ] {
+            assert_eq!(
+                create_committed(null, &PROPERTIES, 0, &desc, state, null.cast(), iid, out),
+                S_OK
+            );
+        }
+        let (data, _) = buffer_bytes(source).unwrap();
+        // SAFETY: the buffer holds 1024 bytes.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(data, 1024) };
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let (out, _) = buffer_bytes(target).unwrap();
+        // SAFETY: the buffer holds 2048 bytes.
+        let out = unsafe { std::slice::from_raw_parts_mut(out, 2048) };
+        out.fill(0xEE);
+
+        let queue_iid = guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+            S_OK
+        );
+
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        let rows = PlacedFootprint {
+            offset: 0,
+            format: 28,
+            width: 4,
+            height: 4,
+            depth: 1,
+            row_pitch: 256,
+        };
+        let subresource = |resource| Location {
+            resource,
+            kind: 0,
+            footprint: rows,
+        };
+        let placed = |resource, offset| Location {
+            resource,
+            kind: 1,
+            footprint: PlacedFootprint { offset, ..rows },
+        };
+        const AT: usize = 64;
+        type Copy =
+            extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        let copy = slot::<Copy>(list, 0x80);
+        let (image_at, source_at) = (subresource(image), placed(source, 0));
+        copy(list, &image_at, 0, 0, 0, &source_at, null.cast());
+        let target_at = placed(target, AT as u64);
+        copy(list, &target_at, 0, 0, 0, &image_at, null.cast());
+        slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
+        slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
+
+        // Submissions are complete when they return.
+        for row in 0..4 {
+            let (from, to) = (row * 256, AT + row * 256);
+            assert_eq!(out[to..to + 16], bytes[from..from + 16], "row {row}");
+            if row < 3 {
+                assert!(
+                    out[to + 16..to + 256].iter().all(|&b| b == 0xEE),
+                    "pitch padding after row {row}"
+                );
+            }
+        }
+        assert!(out[..AT].iter().all(|&b| b == 0xEE), "before the footprint");
+        let end = AT + 3 * 256 + 16;
+        assert!(out[end..].iter().all(|&b| b == 0xEE), "after the footprint");
+    }
+
     #[test]
     fn committed_and_placed_resources_map_at_their_gpu_address() {
         let null = std::ptr::null();

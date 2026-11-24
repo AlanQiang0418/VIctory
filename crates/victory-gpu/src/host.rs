@@ -409,6 +409,9 @@ struct Deferred {
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
+    /// Copies the GPU made into host memory, put into title memory once
+    /// the list has run: title address, host address, bytes.
+    readbacks: Vec<(usize, usize, usize)>,
     /// Whether a step zeroes the indirect-work budget.
     budget_zeroed: bool,
 }
@@ -596,6 +599,15 @@ impl Host {
             let (address, len) = (*address, *len);
             let written = shadow.copy_back(address, len);
             COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+        }
+        for list in runs {
+            for &(dst, src, len) in &list.deferred().readbacks {
+                // Through the kernel, so guarded blocks are opened first:
+                // the next refresh of a copy over them takes these bytes.
+                crate::watch::writing(dst, len);
+                write_mapped(dst as *mut u8, src as *const u8, len);
+                COPY_BACK[1].fetch_add(len as u64, Ordering::Relaxed);
+            }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         for list in runs {
@@ -1058,6 +1070,15 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::GpuWrite(shadow.clone(), address, len));
+    }
+
+    /// Copies `len` bytes the list's GPU commands write at host address
+    /// `src` (memory the list keeps) into title memory at `dst` once the
+    /// list has run, before its bottom-of-pipe writes tell the title so.
+    pub(crate) fn defer_readback(&self, dst: *mut u8, src: *const u8, len: usize) {
+        self.deferred()
+            .readbacks
+            .push((dst as usize, src as usize, len));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
