@@ -663,6 +663,30 @@ static FUNCTIONS: Table<24> = {
     Table(f)
 };
 
+#[cfg(all(test, windows))]
+pub(crate) fn test_view_heap() -> This {
+    #[repr(C)]
+    struct Extended(HeapDesc, Placement);
+    let desc = Extended(
+        HeapDesc {
+            kind: VIEWS_KIND,
+            count: 1,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        },
+        Placement {
+            address: 0,
+            size: 0,
+        },
+    );
+    let mut out = std::ptr::null();
+    assert_eq!(
+        create_heap(std::ptr::null(), &desc.0, &HEAP_IIDS[0], &mut out),
+        crate::object::S_OK,
+    );
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

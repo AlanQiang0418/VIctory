@@ -1202,6 +1202,169 @@ pub(crate) fn stencil_ref(list: &HostList, reference: u32) {
 mod tests {
     use super::*;
 
+    fn interior_pair_shader() -> (victory_shader::emit::HostShader, Vec<UsedResource>) {
+        use victory_shader::native::{ComputeIo, HwStage, NativeProgram, RootParam, StageIo};
+        use victory_shader::{Container, emit, io, ir, resource, structure};
+
+        let words = [
+            0x8809_FF02u32,
+            0x0010_0000, // s_or_b32 s9, s2, 0x100000
+            0xBE88_0301, // s_mov_b32 s8, s1
+            0xBE8A_03C1, // s_mov_b32 s10, -1
+            0xBE8B_03FF,
+            0x1101_4FAC, // s_mov_b32 s11, 0x11014fac
+            0xF420_0304,
+            0xFA00_0000, // s_buffer_load_dword s12, s[8:11], null
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0402,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[4:5], null
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E00_020C, // v_mov_b32 v0, s12
+            0x4A00_0000, // v_add_nc_u32 v0, s0, v0
+            0x3A00_0003, // v_xor_b32 v0, s3, v0
+            0xE070_0000,
+            0x8004_0000, // buffer_store_dword v0, off, s[16:19], 0
+            0xBF8C_3F70, // s_waitcnt vmcnt(0)
+            0xBF81_0000, // s_endpgm
+        ];
+        let layout = |root, sgprs, user_data, slot| RootParam {
+            root,
+            sgprs,
+            user_data,
+            slot,
+            table_offset_dwords: 0,
+            base_register: 0,
+        };
+        let used = vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        }];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![
+                layout(RootType::Constants, 4, 0, 0),
+                layout(RootType::Table, 1, 4, 1),
+            ],
+            used: used.clone(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        };
+        let p = ir::build(&native.code, false, 8).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage).unwrap();
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let c = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        (emit::emit(&c, &native, &p, &st, &io, &res).unwrap(), used)
+    }
+
+    #[test]
+    fn dispatch_reads_interior_constant_pair_and_surrounding_constants() {
+        use crate::descriptor;
+        use crate::object::slot;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+
+        let (shader, used) = interior_pair_shader();
+        assert_eq!(
+            shader.root_cbvs,
+            [RootView {
+                slot: 0,
+                dword: Some(1)
+            }
+            .register()]
+        );
+        let Some(host) = crate::host::host() else {
+            eprintln!("Skipping interior-pair readback because D3D12 is unavailable");
+            return;
+        };
+
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let allocate = || {
+            // SAFETY: allocate a whole aligned page for shadow refresh and copy-back.
+            let ptr = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    64 << 10,
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            };
+            assert!(!ptr.is_null());
+            ptr.cast::<u32>()
+        };
+        let src = allocate();
+        let dst = allocate();
+        let (src_addr, dst_addr) = (src as u64, dst as u64);
+        crate::shadow::register(src as usize, src_addr, 64 << 10);
+        crate::shadow::register(dst as usize, dst_addr, 4);
+        let value = 0xDEAD_BEEF;
+        // SAFETY: first dword of the registered source page.
+        unsafe { src.write(value) };
+
+        let null = std::ptr::null();
+        let heap_obj = descriptor::test_view_heap();
+        let table = descriptor::heap(heap_obj).start;
+        let mut resource = [0; 14];
+        resource[0] = 1; // BUFFER
+        resource[4] = 4;
+        let mut uav = [0; 16];
+        uav[0] = 39; // R32_TYPELESS
+        uav[1] = 1; // BUFFER UAV
+        uav[4] = 1; // NumElements
+        uav[8] = 1; // RAW
+        uav[10] = dst_addr as u32;
+        uav[11] = (dst_addr >> 32) as u32;
+        descriptor::create_placed_uav(null, &resource, &uav, table);
+
+        let pso = crate::pipeline::test_compute_pipeline(shader, used);
+        let list = host.new_list().unwrap();
+        let mut state = State::default();
+        let (leading, trailing) = (0x0155_AA77, 0x2211_33FF);
+        state.set_pipeline(pso);
+        state.set_heaps(&[heap_obj]);
+        state.set_constants(
+            true,
+            0,
+            &[leading, src_addr as u32, (src_addr >> 32) as u32, trailing],
+            0,
+        );
+        state.set_table(true, 1, table);
+        state.dispatch(&list, 1, 1, 1);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: first dword of the registered destination, after completion.
+        assert_eq!(unsafe { dst.read() }, value.wrapping_add(leading) ^ trailing);
+
+        drop(state);
+        for object in [pso, heap_obj] {
+            slot::<extern "system" fn(This) -> u32>(object, 0x10)(object);
+        }
+        crate::shadow::unregister(src as usize, src_addr);
+        crate::shadow::unregister(dst as usize, dst_addr);
+        // SAFETY: both allocations were created above and the host wait completed.
+        unsafe {
+            VirtualFree(src.cast(), 0, MEM_RELEASE);
+            VirtualFree(dst.cast(), 0, MEM_RELEASE);
+        }
+        eprintln!("Interior-pair readback passed");
+    }
+
     #[test]
     fn root_views_read_their_address_where_the_title_sets_it() {
         let mut s = State::default();
