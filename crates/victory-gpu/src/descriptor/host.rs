@@ -700,40 +700,61 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
 /// The byte stride of a buffer view (its element size, at least 1), 0 for
 /// other views: what the view-stride table holds for it.
 fn view_stride(view: &View) -> u32 {
+    view_elements(view).0
+}
+
+/// Where a copy of `view`'s bytes may start for the host view made of it
+/// ([`buffer_srv`], [`buffer_uav`]): on 16 bytes for a structured view,
+/// which is made raw ([`raw_srv`]), else on one of its elements.
+fn view_align(view: &View) -> u64 {
+    match view_elements(view) {
+        (_, structured) if raw_range(0, 1, structured).is_some() => RAW_ALIGN,
+        (element, _) => u64::from(element),
+    }
+}
+
+/// [`view_stride`], and the view's structure stride (0 if not structured).
+fn view_elements(view: &View) -> (u32, u32) {
     let (unordered, words): (bool, &[u32; 10]) = match view {
         // Read as raw buffers (`make`).
-        View::Constant(..) => return 4,
+        View::Constant(..) => return (4, 0),
         View::Shader(_, Some(desc)) => (false, desc),
         View::Unordered(_, _, Some(desc)) => (true, desc),
         View::Placed(unordered, resource, desc) if resource[0] == 1 => {
             match desc[..10].try_into() {
                 Ok(words) => (*unordered, words),
-                Err(_) => return 0,
+                Err(_) => return (0, 0),
             }
         }
-        _ => return 0,
+        _ => return (0, 0),
     };
     // The view dimension: buffer (1) for shader and unordered views alike.
     if words[1] != 1 {
-        return 0;
+        return (0, 0);
     }
-    let element = if unordered {
+    let (element, structured) = if unordered {
         let desc = uav_desc(words);
         // SAFETY: a buffer view's union member.
         let buffer = unsafe { desc.Anonymous.Buffer };
-        if buffer.StructureByteStride > 0 {
+        let element = if buffer.StructureByteStride > 0 {
             u64::from(buffer.StructureByteStride)
         } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
             4
         } else {
             crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
-        }
+        };
+        (element, buffer.StructureByteStride)
     } else {
-        element_size(&srv_desc(words))
+        let desc = srv_desc(words);
+        // SAFETY: a buffer view's union member.
+        (
+            element_size(&desc),
+            unsafe { desc.Anonymous.Buffer }.StructureByteStride,
+        )
     };
     // Nonzero: shaders taking views at computed indices read the null buffer
     // view where the table holds 0 (`victory_shader::emit`).
-    element.max(1) as u32
+    (element.max(1) as u32, structured)
 }
 
 /// A buffer view of title memory at `address` on its host copy: the first
@@ -797,7 +818,7 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
 /// reads, [`crate::shadow::for_view`]) and the view's title range.
 pub(crate) fn view_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::Shadow>, u64, u64)> {
     let (address, len) = buffer_range(view)?;
-    let (shadow, _) = crate::shadow::for_view(address, len, u64::from(view_stride(view)))?;
+    let (shadow, _) = crate::shadow::for_view(address, len, view_align(view))?;
     Some((shadow, address, len))
 }
 
@@ -834,6 +855,7 @@ fn buffer_srv(
     mut desc: D3D12_SHADER_RESOURCE_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    let raw = raw_srv(&mut desc);
     let element = element_size(&desc);
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
@@ -843,8 +865,9 @@ fn buffer_srv(
     }
     // The copy its own bytes are in, its first element counted from there.
     let start = address + buffer.FirstElement * element;
+    let align = if raw { RAW_ALIGN } else { element };
     let Some((shadow, own)) =
-        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)
+        crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, align)
     else {
         #[cfg(feature = "diagnostics")]
         if REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 200 {
@@ -883,6 +906,72 @@ fn within(width: u64, first: u64, count: u32, element: u64) -> bool {
     count > 0 && first.saturating_add(u64::from(count)).saturating_mul(element) <= width
 }
 
+/// A structured buffer view made a raw one over the same bytes (stride a
+/// multiple of 4, as the translator requires; others are left as they
+/// are). Shaders read heap views at computed indices as raw buffers, the
+/// stride from the view-stride table, and their structured reads know the
+/// stride when compiled; NVIDIA addresses a structured view by its own
+/// stride whatever the read (a raw read at byte `b` of a 12-byte view lands
+/// at `b / 4 * 12`), so only a raw view reads the same everywhere. AMD
+/// reads both views alike.
+///
+/// A raw view starts on 16 bytes of its buffer
+/// (`D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT`), a structured one on any element:
+/// a view whose start is not on 16 bytes of its copy gets a copy of its own
+/// bytes ([`crate::shadow::for_view`]). Returns whether it was made raw.
+fn raw_srv(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC) -> bool {
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { &mut desc.Anonymous.Buffer };
+    let Some((first, count)) = raw_range(
+        buffer.FirstElement,
+        buffer.NumElements,
+        buffer.StructureByteStride,
+    ) else {
+        return false;
+    };
+    (buffer.FirstElement, buffer.NumElements) = (first, count);
+    buffer.StructureByteStride = 0;
+    buffer.Flags |= D3D12_BUFFER_SRV_FLAG_RAW;
+    desc.Format = DXGI_FORMAT_R32_TYPELESS;
+    true
+}
+
+/// [`raw_srv`] for an unordered access view (a structured view's counter is
+/// not kept: buffer views of title memory have none, `buffer_uav`).
+fn raw_uav(desc: &mut D3D12_UNORDERED_ACCESS_VIEW_DESC) -> bool {
+    // SAFETY: a buffer view's union member.
+    let buffer = unsafe { &mut desc.Anonymous.Buffer };
+    let Some((first, count)) = raw_range(
+        buffer.FirstElement,
+        buffer.NumElements,
+        buffer.StructureByteStride,
+    ) else {
+        return false;
+    };
+    (buffer.FirstElement, buffer.NumElements) = (first, count);
+    buffer.StructureByteStride = 0;
+    buffer.Flags |= D3D12_BUFFER_UAV_FLAG_RAW;
+    desc.Format = DXGI_FORMAT_R32_TYPELESS;
+    true
+}
+
+/// A structured view's first element and count in the dwords of a raw view
+/// of the same bytes; `None` if it is not structured, its stride is not a
+/// whole number of dwords, or the count does not fit.
+/// Where a raw view may start in its buffer, in bytes.
+const RAW_ALIGN: u64 = D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT as u64;
+
+fn raw_range(first: u64, count: u32, stride: u32) -> Option<(u64, u32)> {
+    if stride == 0 || !stride.is_multiple_of(4) {
+        return None;
+    }
+    let words = u64::from(stride / 4);
+    Some((
+        first.checked_mul(words)?,
+        u32::try_from(u64::from(count) * words).ok()?,
+    ))
+}
+
 /// An unordered access view of title buffer memory at `address` (`len`
 /// bytes) on its host copy, as [`buffer_srv`]; false if the copy cannot be
 /// written by shaders (upload memory).
@@ -894,6 +983,8 @@ fn buffer_uav(
     mut desc: D3D12_UNORDERED_ACCESS_VIEW_DESC,
     at: D3D12_CPU_DESCRIPTOR_HANDLE,
 ) -> Option<Kept> {
+    let raw = raw_uav(&mut desc);
+    let format = desc.Format;
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let element = if buffer.StructureByteStride > 0 {
@@ -901,14 +992,15 @@ fn buffer_uav(
     } else if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 {
         4
     } else {
-        crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+        crate::resource::element(format.0 as u32).map_or(0, |(bytes, _)| bytes)
     };
     if element == 0 {
         once!(len, "unordered buffer view of elements without a size");
         return None;
     }
     let start = address + buffer.FirstElement * element;
-    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, element)?;
+    let align = if raw { RAW_ALIGN } else { element };
+    let (shadow, own) = crate::shadow::for_view(start, u64::from(buffer.NumElements) * element, align)?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -1359,6 +1451,68 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A structured view becomes a raw view of the same bytes; typed views
+    /// and strides that are not whole dwords stay as they are.
+    #[test]
+    fn structured_buffer_views_become_raw_views_of_the_same_bytes() {
+        let view = |format, first, count, stride, flags| {
+            let mut desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: format,
+                ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+                ..Default::default()
+            };
+            desc.Anonymous.Buffer = D3D12_BUFFER_SRV {
+                FirstElement: first,
+                NumElements: count,
+                StructureByteStride: stride,
+                Flags: flags,
+            };
+            raw_srv(&mut desc);
+            // SAFETY: a buffer view's union member.
+            let b = unsafe { desc.Anonymous.Buffer };
+            (
+                desc.Format,
+                b.FirstElement,
+                b.NumElements,
+                b.StructureByteStride,
+                b.Flags,
+            )
+        };
+        // 10 elements of 12 bytes from element 5: bytes 60..180, dwords 15..45.
+        assert_eq!(
+            view(DXGI_FORMAT_UNKNOWN, 5, 10, 12, D3D12_BUFFER_SRV_FLAG_NONE),
+            (
+                DXGI_FORMAT_R32_TYPELESS,
+                15,
+                30,
+                0,
+                D3D12_BUFFER_SRV_FLAG_RAW
+            )
+        );
+        assert_eq!(
+            element_size(&{
+                let mut d = D3D12_SHADER_RESOURCE_VIEW_DESC::default();
+                d.Anonymous.Buffer = D3D12_BUFFER_SRV {
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                    ..Default::default()
+                };
+                d
+            }),
+            4
+        );
+        let typed = (
+            DXGI_FORMAT_R32G32B32A32_FLOAT,
+            2,
+            8,
+            0,
+            D3D12_BUFFER_SRV_FLAG_NONE,
+        );
+        assert_eq!(view(typed.0, typed.1, typed.2, typed.3, typed.4), typed);
+        let odd = (DXGI_FORMAT_UNKNOWN, 3, 4, 6, D3D12_BUFFER_SRV_FLAG_NONE);
+        assert_eq!(view(odd.0, odd.1, odd.2, odd.3, odd.4), odd);
+        assert_eq!(raw_range(1, u32::MAX, 8), None);
+    }
 
     /// The world's 16-byte view of 0 elements removed the device.
     #[test]

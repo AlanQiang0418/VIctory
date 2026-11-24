@@ -1214,7 +1214,10 @@ pub enum Stride {
     Raw,
     /// RGBA32F elements.
     Typed,
-    /// Structured, elements of this many bytes.
+    /// Structured, elements of this many bytes: made a raw view of the same
+    /// bytes, as the runtime makes the title's structured views
+    /// (`victory_gpu::descriptor::host::raw_srv`; NVIDIA reads a structured
+    /// view by its own stride, whatever the shader's read).
     Structured(u32),
     /// Typed, elements in this format of this many bytes.
     Format(DXGI_FORMAT, u32),
@@ -1592,11 +1595,11 @@ impl Host {
                                 0,
                                 D3D12_BUFFER_SRV_FLAG_NONE,
                             ),
-                            Stride::Structured(s) => (
-                                DXGI_FORMAT_UNKNOWN,
-                                data.len() * 4 / s as usize,
-                                s,
-                                D3D12_BUFFER_SRV_FLAG_NONE,
+                            Stride::Structured(_) => (
+                                DXGI_FORMAT_R32_TYPELESS,
+                                data.len(),
+                                0,
+                                D3D12_BUFFER_SRV_FLAG_RAW,
                             ),
                             Stride::Format(f, bytes) => (
                                 f,

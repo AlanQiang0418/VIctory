@@ -2416,7 +2416,10 @@ void main(uint3 id : SV_DispatchThreadID) {
             // SAFETY: a live buffer.
             unsafe { made.GetDesc() }.Width
         };
-        assert_eq!(width(start + 456), 1 << 16, "on an element: the buffer's copy");
+        assert_eq!(width(start + 4 * 456), 1 << 16, "on an element and 16 bytes: the buffer's copy");
+        // Made raw (NVIDIA reads structured views by their own stride), a
+        // view starts on 16 bytes of its buffer: 456 is not.
+        assert_eq!(width(start + 456), (4 * 456u64).next_multiple_of(256), "on an element only: its own bytes");
         assert_eq!(width(start + 100), (4 * 456u64).next_multiple_of(256), "off: its own bytes");
         let (copy, address, len) = crate::descriptor::host::view_copy(&view(start + 100)).unwrap();
         assert_eq!((copy.range(), address, len), ((start + 100, 4 * 456), start + 100, 4 * 456));
