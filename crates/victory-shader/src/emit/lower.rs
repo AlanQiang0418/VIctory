@@ -5627,20 +5627,20 @@ impl<'a> Lower<'a> {
         };
         // 1D and 1D arrays are read as 2D ones one texel high, as the host
         // makes their textures and views (a title's 1D texture is also
-        // sampled with 2D instructions): the addresses are read as 1D and
-        // get y = 0 (`flat_to_2d`), the slice moving to the third place.
+        // sampled with 2D instructions): insert y after x, moving an
+        // array slice to the third coordinate.
         let flat = kind == 1 || kind == 6;
         let host_kind = match kind {
             1 => 2,
             6 => 7,
             k => k,
         };
-        let flat_to_2d = |cs: &mut [V], zero: V| {
+        let flat_to_2d = |cs: &mut [V], y: V| {
             if kind == 6 {
                 cs[2] = cs[1];
             }
             if flat {
-                cs[1] = zero;
+                cs[1] = y;
             }
         };
         // Address VGPRs in order.
@@ -5919,7 +5919,9 @@ impl<'a> Lower<'a> {
                     *slot = self.s.m.bin(c, Bin::SDiv, *slot, n);
                 }
             }
-            flat_to_2d(&mut cs, self.s.m.f32(0));
+            // Sample the center of the only row, so a linear border sampler
+            // cannot blend the border into a 1D read.
+            flat_to_2d(&mut cs, self.s.m.f32(0.5f32.to_bits()));
             if op == 81 {
                 // The clamped then the unclamped level of detail.
                 let Operand::Vector { reg, .. } = *data else {

@@ -92,11 +92,8 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
     shader
 }
 
-/// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
-/// hardware GPU and on WARP (each skipped without a device) and returns,
-/// per one that ran, the UAV's 32 dwords.
-fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
-    let samplers = [D3D12_SAMPLER_DESC {
+fn point_clamp() -> D3D12_SAMPLER_DESC {
+    D3D12_SAMPLER_DESC {
         Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
         AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
         AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
@@ -104,7 +101,17 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
         MaxAnisotropy: 1,
         MaxLOD: f32::MAX,
         ..Default::default()
-    }];
+    }
+}
+
+/// Runs `shader` with `views` at heap indices 0.. (the UAV last) on the
+/// hardware GPU and on WARP (each skipped without a device) and returns,
+/// per one that ran, the UAV's 32 dwords.
+fn run(
+    shader: &HostShader,
+    views: &[View],
+    sampler: D3D12_SAMPLER_DESC,
+) -> Vec<(&'static str, Vec<u32>)> {
     let mut out = Vec::new();
     // One GPU test at a time, with the VALU tests: in parallel on the
     // hardware adapter and WARP the test process sometimes died of an
@@ -134,7 +141,7 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
                 &Dispatch {
                     roots: vec![(0, Root::Constants(ud))],
                     views,
-                    samplers: &samplers,
+                    samplers: &[sampler],
                     groups: [1, 1, 1],
                 },
             )
@@ -146,7 +153,7 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
 
 /// The red channel each lane sampled from two 1x1 textures, red 1.0 at
 /// heap index 0 and 2.0 at 1.
-fn sampled(shader: &HostShader) -> Vec<(&'static str, Vec<f32>)> {
+fn sampled(shader: &HostShader, sampler: D3D12_SAMPLER_DESC) -> Vec<(&'static str, Vec<f32>)> {
     let first = [[1.0f32, 0.0, 0.0, 1.0]];
     let second = [[2.0f32, 0.0, 0.0, 1.0]];
     let views = [
@@ -154,7 +161,7 @@ fn sampled(shader: &HostShader) -> Vec<(&'static str, Vec<f32>)> {
         View::Texture(1, 1, &second),
         View::RawUav(32),
     ];
-    run(shader, &views)
+    run(shader, &views, sampler)
         .into_iter()
         .map(|(label, words)| (label, words.into_iter().map(f32::from_bits).collect()))
         .collect()
@@ -164,7 +171,7 @@ fn sampled(shader: &HostShader) -> Vec<(&'static str, Vec<f32>)> {
 fn lanes_sample_the_texture_their_if_else_arm_chose() {
     use crate::resource::tests::WATERFALL_JOINED_WAVE32;
     let shader = build(WATERFALL_JOINED_WAVE32, false);
-    for (label, red) in sampled(&shader) {
+    for (label, red) in sampled(&shader, point_clamp()) {
         // Lanes below 16 took the first texture, the others the second.
         let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
         assert_eq!(red, want, "{label}");
@@ -175,7 +182,7 @@ fn lanes_sample_the_texture_their_if_else_arm_chose() {
 fn lanes_sample_the_texture_their_arm_loaded_or_picked() {
     use crate::resource::tests::WATERFALL_JOINED_MIXED_WAVE32;
     let shader = build(WATERFALL_JOINED_MIXED_WAVE32, false);
-    for (label, red) in sampled(&shader) {
+    for (label, red) in sampled(&shader, point_clamp()) {
         // Lanes below 16 loaded entry (lane & 1); of the others, lanes
         // below 24 picked the first, the rest the second.
         let want: Vec<f32> = (0..32)
@@ -206,7 +213,7 @@ fn lanes_load_from_the_buffer_their_nested_arms_chose() {
         },
         View::RawUav(32),
     ];
-    for (label, got) in run(&shader, &views) {
+    for (label, got) in run(&shader, &views, point_clamp()) {
         // Dword `lane` of the first buffer below 16, of the second from 16
         // to 23; lanes from 24 on load and store nothing.
         let want: Vec<u32> = (0..32)
@@ -224,7 +231,7 @@ fn lanes_load_from_the_buffer_their_nested_arms_chose() {
 fn lanes_sample_the_entry_their_offset_names_in_the_console_waterfall() {
     use crate::resource::tests::WATERFALL_INDEXED_WAVE32;
     let shader = build(WATERFALL_INDEXED_WAVE32, false);
-    let results = sampled(&shader);
+    let results = sampled(&shader, point_clamp());
     assert!(!results.is_empty());
     for (label, red) in results {
         // Even lanes hold entry 0's offset, odd lanes entry 1's.
@@ -235,14 +242,17 @@ fn lanes_sample_the_entry_their_offset_names_in_the_console_waterfall() {
 
 /// [`lanes_sample_the_entry_their_offset_names_in_the_console_waterfall`]
 /// with a 1D sample (`dim:SQ_RSRC_IMG_1D`, x only): translated as a 2D
-/// read (y = 0) of the 2D textures the host makes for 1D ones, it validates
-/// and every lane still reads its own texture.
+/// read at the center of the only row. A black border on V would contribute
+/// half the result at y = 0 with linear filtering.
 #[test]
 fn a_1d_sample_reads_the_one_texel_high_2d_texture() {
     use crate::resource::tests::WATERFALL_INDEXED_WAVE32;
     const SAMPLE_2D: u32 = 0xF09C_0F08;
     let mut words = WATERFALL_INDEXED_WAVE32.to_vec();
-    let at = words.iter().position(|&w| w == SAMPLE_2D).expect("the sample");
+    let at = words
+        .iter()
+        .position(|&w| w == SAMPLE_2D)
+        .expect("the sample");
     // DIM, bits 5:3 of the first dword: 1 (2D) to 0 (1D).
     words[at] = SAMPLE_2D & !(7 << 3);
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -254,7 +264,12 @@ fn a_1d_sample_reads_the_one_texel_high_2d_texture() {
         .expect("the sample's text");
     assert!(text.contains("dim:SQ_RSRC_IMG_1D"), "{text}");
     let shader = build(&words, false);
-    let results = sampled(&shader);
+    let sampler = D3D12_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_BORDER,
+        ..point_clamp()
+    };
+    let results = sampled(&shader, sampler);
     assert!(!results.is_empty());
     for (label, red) in results {
         let want: Vec<f32> = (0..32).map(|l| [1.0, 2.0][l & 1]).collect();
@@ -269,7 +284,7 @@ fn lanes_sample_their_own_texture_in_a_waterfall_narrowed_by_v_cmpx() {
     let want: Vec<f32> = (0..32).map(|l| if l < 16 { 1.0 } else { 2.0 }).collect();
     for folded in [false, true] {
         let shader = build(&cmpx_waterfall(false, folded), false);
-        let results = sampled(&shader);
+        let results = sampled(&shader, point_clamp());
         assert!(!results.is_empty());
         for (label, red) in results {
             assert_eq!(red, want, "{label}, folded {folded}");
