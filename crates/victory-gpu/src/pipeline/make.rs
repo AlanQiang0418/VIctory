@@ -59,6 +59,12 @@ impl Pending {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn make_for_test(&self) {
+        self.make();
+        assert!(self.made.get().is_some_and(Option::is_some));
+    }
+
     fn make(&self) {
         self.made
             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
