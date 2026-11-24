@@ -7639,17 +7639,24 @@ impl<'a> Lower<'a> {
                 .copied()
                 .ok_or("an untracked sampler")?;
             if matches!(name, "image_gather4_l" | "image_gather4_l_o") {
-                if *a16 || *d16 || *unorm || kind != 2 {
-                    return Err(
-                        "a gather at a level of 16-bit values, texel coordinates or not 2D",
-                    );
+                if kind != 2 && kind != 7 {
+                    return Err("a gather at a level of a texture other than 2D or 2D array");
                 }
-                let n = 3 + usize::from(name.ends_with("_o"));
+                let n = usize::from(name.ends_with("_o")) + coords + 1;
                 let a = (0..n)
                     .map(|k| addr_val(self, k))
                     .collect::<Result<Vec<_>, _>>()?;
-                let lod = inst.read(Reg::V(regs[n - 1])).ok_or("an image address")?;
-                return self.gather_at_level(inst, h, ss, &a, lod, guard);
+                let lod_k = n - 1;
+                let lod_reg = if *a16 {
+                    extra + (lod_k - extra) / 2
+                } else {
+                    lod_k
+                };
+                let lod = inst
+                    .read(Reg::V(*regs.get(lod_reg).ok_or("an image address")?))
+                    .ok_or("an image address")?;
+                let lod_hi = *a16 && !(lod_k - extra).is_multiple_of(2);
+                return self.gather_at_level(inst, h, kind, ss, &a, (lod, lod_hi), guard);
             }
             // Comparison: the reference value is the first address after
             // the bias, and the sampler is a comparison sampler.
@@ -8033,22 +8040,32 @@ impl<'a> Lower<'a> {
     }
 
     /// `image_gather4_l(_o)`: DXIL gathers only from a view's first level,
-    /// so the four texels are loaded from the level. Only what the title's
-    /// culling shaders use: an immediate sampler without bias whose border
-    /// is transparent black (a texel outside reads as a load outside: 0),
-    /// and a level of detail proven whole (which level a fraction picks is
-    /// not known; a whole one is that level, clamped to the sampler's and
-    /// the view's).
+    /// so the four texels are loaded from the level for 2D and 2D-array
+    /// textures (with optional `a16`, `d16`, and unnormalized coordinates).
+    /// Supports immediate samplers using wrap, mirror, clamp-to-edge,
+    /// mirror-once, clamp-to-border, or mirror-once-border addressing, all
+    /// three built-in border colours, whole LOD limits/bias, and a level of
+    /// detail proven whole whenever the sampler enables a mip filter.
+    #[allow(clippy::too_many_arguments)]
     fn gather_at_level(
         &mut self,
         inst: &Inst,
         h: V,
+        kind: u32,
         sampler: &Source,
         a: &[V],
-        lod: Value,
+        lod: (Value, bool),
         guard: Option<V>,
     ) -> Result<(), Why> {
-        let Fields::Image { data, dmask, .. } = &inst.fields else {
+        let Fields::Image {
+            data,
+            dmask,
+            a16,
+            d16,
+            unorm,
+            ..
+        } = &inst.fields
+        else {
             unreachable!()
         };
         let Source::Constant(w) = sampler else {
@@ -8058,16 +8075,25 @@ impl<'a> Lower<'a> {
             return Err("a sampler constant");
         };
         let bits = |word: u32, at: u32, n: u32| word >> at & ((1 << n) - 1);
-        // Clamp to a border (x, y) of transparent black; no anisotropy,
-        // unnormalized or truncated coordinates, reduction or bias; whole
-        // level limits.
-        if w0 & 0x3F != 0x36
-            || w0 & (7 << 9 | 1 << 15 | 1 << 19 | 1 << 27 | 3 << 29) != 0
-            || bits(w3, 30, 2) != 0
-            || bits(w2, 0, 20) != 0
+        let clamp = [bits(w0, 0, 3), bits(w0, 3, 3)];
+        let unnormalized = *unorm || w0 & (1 << 15) != 0;
+        let uses_border = clamp.iter().any(|&m| matches!(m, 6 | 7));
+        let border_type = bits(w3, 30, 2);
+        // Supported address modes: wrap (0), mirror (1), clamp (2),
+        // mirror-once (3), clamp-border (6), mirror-once-border (7).
+        // Unnormalized texel coordinates only pair with clamp/border modes;
+        // anisotropy, truncated coordinates, disable-cube-wrap, reduction
+        // filters, custom border colours (when border is used), and
+        // fractional LOD limits/bias remain refused.
+        if clamp.iter().any(|&m| matches!(m, 4 | 5))
+            || (unnormalized && clamp.iter().any(|&m| matches!(m, 0 | 1)))
+            || w0 & (7 << 9 | 1 << 19 | 1 << 27 | 3 << 29) != 0
+            || (uses_border && border_type == 3)
+            || bits(w2, 0, 8) != 0
+            || bits(w2, 14, 6) != 0
             || w1 & 0x0F_F0FF != 0
         {
-            return Err("a gather at a level through a sampler other than a black border's");
+            return Err("a gather at a level through an unsupported sampler");
         }
         // No channel enabled: the first.
         let dmask = if *dmask == 0 { 1 } else { *dmask };
@@ -8075,16 +8101,44 @@ impl<'a> Lower<'a> {
             return Err("a gather of several channels");
         }
         let mip_filter = bits(w2, 26, 2) != 0;
-        if mip_filter && self.whole(lod, &mut HashSet::new()) != Some(true) {
-            return Err("a gather at a level that may not be whole");
+        if mip_filter {
+            let is_whole = if *a16 {
+                self.whole_f16(lod.0, lod.1, &mut HashSet::new())
+            } else {
+                self.whole(lod.0, &mut HashSet::new())
+            };
+            if is_whole != Some(true) {
+                return Err("a gather at a level that may not be whole");
+            }
         }
         let c = self.cur;
         let i32t = self.s.t.i32;
+        let f32t = self.s.t.f32;
         let dims_t = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-        let zero = self.s.m.i32(0);
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        let to_f32 = |l: &mut Self, v: V| -> V {
+            if *a16 {
+                l.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[v])
+            } else {
+                l.as_float(v)
+            }
+        };
+        let has_offset = inst.name().ends_with("_o");
+        let base = usize::from(has_offset);
+        let u_f = to_f32(self, a[base]);
+        let v_f = to_f32(self, a[base + 1]);
+        let slice_f = (kind == 7).then(|| to_f32(self, a[base + 2]));
+        let lod_f = to_f32(self, a[a.len() - 1]);
         let level = if mip_filter {
-            // The sampler's limits, then the view's last level.
-            let f = self.as_float(a[a.len() - 1]);
+            // Apply whole sampler LOD bias, clamp to the sampler's limits,
+            // then to the view's last level.
+            let mut f = lod_f;
+            let bias_raw = bits(w2, 0, 14);
+            if bias_raw != 0 {
+                let bias = ((bias_raw << 18) as i32 >> 18) as f32 / 256.0;
+                let kb = self.s.m.f32(bias.to_bits());
+                f = self.s.m.bin(c, Bin::Add, f, kb);
+            }
             let lo = self.s.m.f32((bits(w1, 0, 12) as f32 / 256.0).to_bits());
             let hi = self.s.m.f32((bits(w1, 12, 12) as f32 / 256.0).to_bits());
             let f = self.binary(35, f, lo);
@@ -8094,7 +8148,6 @@ impl<'a> Lower<'a> {
                 .s
                 .op(c, "getDimensions", Attr::ReadOnly, dims_t, 72, &[h, zero]);
             let levels = self.s.m.extract(c, d, 3);
-            let one = self.s.m.i32(1);
             let last = self.s.m.bin(c, Bin::Sub, levels, one);
             let past = self.s.m.cmp(c, pred::SGT, l, last);
             self.s.m.select(c, past, last, l)
@@ -8104,11 +8157,15 @@ impl<'a> Lower<'a> {
         let d = self
             .s
             .op(c, "getDimensions", Attr::ReadOnly, dims_t, 72, &[h, level]);
-        let offset = (a.len() == 4).then(|| a[0]);
+        let offset = has_offset.then(|| a[0]);
+        let sizes = [
+            self.s.m.extract(c, d, 0),
+            self.s.m.extract(c, d, 1),
+        ];
+        let coord_f = [u_f, v_f];
         let mut first = [zero; 2];
         for (k, at) in [(0, 26), (1, 18)] {
-            let size = self.s.m.extract(c, d, k as u32);
-            first[k] = self.gather_first(a[a.len() - 3 + k], size);
+            first[k] = self.gather_first(coord_f[k], sizes[k], clamp[k], unnormalized);
             if let Some(o) = offset {
                 // Bits at..at+5 of the offset word sign-extended.
                 let left = self.s.m.i32(at);
@@ -8118,23 +8175,46 @@ impl<'a> Lower<'a> {
                 first[k] = self.s.m.bin(c, Bin::Add, first[k], o);
             }
         }
-        // Texels (x, y + 1), (x + 1, y + 1), (x + 1, y), (x, y).
-        let one = self.s.m.i32(1);
+        let ch = dmask.trailing_zeros();
+        // Transparent black (0) and opaque black's RGB channels return 0.0
+        // out of bounds, which `textureLoad` already does. Opaque white (2)
+        // and opaque black's alpha channel (1, ch 3) return 1.0 out of bounds.
+        let border_one = border_type == 2 || (border_type == 1 && ch == 3);
         let next = first.map(|f| self.s.m.bin(c, Bin::Add, f, one));
+        let (x0, oob_x0) = self.gather_address(first[0], sizes[0], clamp[0], border_one);
+        let (x1, oob_x1) = self.gather_address(next[0], sizes[0], clamp[0], border_one);
+        let (y0, oob_y0) = self.gather_address(first[1], sizes[1], clamp[1], border_one);
+        let (y1, oob_y1) = self.gather_address(next[1], sizes[1], clamp[1], border_one);
         let iu = self.s.m.undef(i32t);
+        let slice = if let Some(s) = slice_f {
+            let num = self.s.m.cmp(c, pred::OEQ, s, s);
+            let fz = self.s.m.f32(0);
+            let s = self.s.m.select(c, num, s, fz);
+            let s = self.unary(26, s);
+            let s = self.binary(35, s, fz);
+            let max_arr = self.s.m.f32(2048.0f32.to_bits());
+            let s = self.binary(36, s, max_arr);
+            let idx = self.s.m.cast(c, Cast::FpToSi, s, i32t);
+            let array_size = self.s.m.extract(c, d, 2);
+            let max_slice = self.s.m.bin(c, Bin::Sub, array_size, one);
+            let past = self.s.m.cmp(c, pred::SGT, idx, max_slice);
+            self.s.m.select(c, past, max_slice, idx)
+        } else {
+            iu
+        };
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
         };
-        for (k, (x, y)) in [
-            (first[0], next[1]),
-            (next[0], next[1]),
-            (next[0], first[1]),
-            (first[0], first[1]),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let args = [h, level, x, y, iu, iu, iu, iu];
+        let one_f = self.s.m.f32(1.0f32.to_bits());
+        // Texels (x, y + 1), (x + 1, y + 1), (x + 1, y), (x, y).
+        let mut xs = Vec::with_capacity(4);
+        for (x, y, ox, oy) in [
+            (x0, y1, oob_x0, oob_y1),
+            (x1, y1, oob_x1, oob_y1),
+            (x1, y0, oob_x1, oob_y0),
+            (x0, y0, oob_x0, oob_y0),
+        ] {
+            let args = [h, level, x, y, slice, iu, iu, iu];
             let r = self.s.op(
                 c,
                 "textureLoad.f32",
@@ -8143,31 +8223,168 @@ impl<'a> Lower<'a> {
                 66,
                 &args,
             );
-            let v = self.s.m.extract(c, r, dmask.trailing_zeros());
-            let v = self.as_int(v);
-            self.write(inst, Reg::V(reg + k as u8), v, guard);
+            let mut v = self.s.m.extract(c, r, ch);
+            let oob = match (ox, oy) {
+                (Some(a), Some(b)) => Some(self.s.m.bin(c, Bin::Or, a, b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            };
+            if let Some(oob) = oob {
+                v = self.s.m.select(c, oob, one_f, v);
+            }
+            xs.push(if *d16 {
+                self.s
+                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[v])
+            } else {
+                self.as_int(v)
+            });
+        }
+        if *d16 {
+            let k16 = self.s.m.i32(16);
+            xs = xs
+                .chunks(2)
+                .map(|p| {
+                    let hi = self.s.m.bin(c, Bin::Shl, p[1], k16);
+                    self.s.m.bin(c, Bin::Or, p[0], hi)
+                })
+                .collect();
+        }
+        for (k, x) in xs.into_iter().enumerate() {
+            self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
     }
 
-    /// The first texel of a gather's footprint along an axis of `size`
-    /// texels at coordinate `u` (bits of a float): floor(u × size − 0.5)
-    /// with the product exact and rounded to 1/256 of a texel, half up, as
-    /// the hardware does (`gather_level_tests`), i.e.
-    /// (floor(u × size × 512) − 255) >> 9, in 64-bit integers. NaN is 0;
-    /// beyond ±2 every texel of the footprint is outside, as at ±2.
-    fn gather_first(&mut self, u: V, size: V) -> V {
+    /// Maps one signed texel coordinate `coord` onto `[0, size)` (or marks
+    /// out-of-bounds for border modes when `border_one` needs an explicit
+    /// `1.0` substitution) according to RDNA2 address mode `mode`.
+    fn gather_address(
+        &mut self,
+        coord: V,
+        size: V,
+        mode: u32,
+        border_one: bool,
+    ) -> (V, Option<V>) {
         let c = self.cur;
-        let f = self.as_float(u);
-        let num = self.s.m.cmp(c, pred::OEQ, f, f);
+        let (zero, one) = (self.s.m.i32(0), self.s.m.i32(1));
+        match mode {
+            // WRAP: Euclidean modulo `size`.
+            0 => {
+                let neg = self.s.m.cmp(c, pred::SLT, coord, zero);
+                let abs_c = self.s.m.bin(c, Bin::Sub, zero, coord);
+                let mag = self.s.m.select(c, neg, abs_c, coord);
+                let rem = self.s.m.bin(c, Bin::URem, mag, size);
+                let is_zero = self.s.m.cmp(c, pred::EQ, rem, zero);
+                let from_end = self.s.m.bin(c, Bin::Sub, size, rem);
+                let neg_wrap = self.s.m.select(c, is_zero, zero, from_end);
+                (self.s.m.select(c, neg, neg_wrap, rem), None)
+            }
+            // MIRROR: Euclidean modulo `2 * size`, reflecting the upper half.
+            1 => {
+                let period = self.s.m.bin(c, Bin::Shl, size, one);
+                let neg = self.s.m.cmp(c, pred::SLT, coord, zero);
+                let abs_c = self.s.m.bin(c, Bin::Sub, zero, coord);
+                let mag = self.s.m.select(c, neg, abs_c, coord);
+                let rem = self.s.m.bin(c, Bin::URem, mag, period);
+                let is_zero = self.s.m.cmp(c, pred::EQ, rem, zero);
+                let from_end = self.s.m.bin(c, Bin::Sub, period, rem);
+                let neg_wrap = self.s.m.select(c, is_zero, zero, from_end);
+                let t = self.s.m.select(c, neg, neg_wrap, rem);
+                let past = self.s.m.cmp(c, pred::SGE, t, size);
+                let last2 = self.s.m.bin(c, Bin::Sub, period, one);
+                let reflected = self.s.m.bin(c, Bin::Sub, last2, t);
+                (self.s.m.select(c, past, reflected, t), None)
+            }
+            // CLAMP_LAST_TEXEL: clamp to `[0, size - 1]`.
+            2 => {
+                let last = self.s.m.bin(c, Bin::Sub, size, one);
+                let lo = self.s.m.cmp(c, pred::SLT, coord, zero);
+                let hi = self.s.m.cmp(c, pred::SGT, coord, last);
+                let clamped = self.s.m.select(c, lo, zero, coord);
+                (self.s.m.select(c, hi, last, clamped), None)
+            }
+            // MIRROR_ONCE_LAST_TEXEL: reflect negatives (`-1 -> 0`) once,
+            // then clamp to `[0, size - 1]`.
+            3 => {
+                let neg = self.s.m.cmp(c, pred::SLT, coord, zero);
+                let ones = self.s.m.i32(u32::MAX);
+                let inv = self.s.m.bin(c, Bin::Xor, coord, ones);
+                let m = self.s.m.select(c, neg, inv, coord);
+                let last = self.s.m.bin(c, Bin::Sub, size, one);
+                let hi = self.s.m.cmp(c, pred::SGT, m, last);
+                (self.s.m.select(c, hi, last, m), None)
+            }
+            // CLAMP_BORDER: out-of-bounds `[0, size)` reads border.
+            6 => {
+                let oob = border_one.then(|| self.s.m.cmp(c, pred::IUGE, coord, size));
+                (coord, oob)
+            }
+            // MIRROR_ONCE_BORDER: reflect negatives once; `>= size` reads border.
+            7 => {
+                let neg = self.s.m.cmp(c, pred::SLT, coord, zero);
+                let ones = self.s.m.i32(u32::MAX);
+                let inv = self.s.m.bin(c, Bin::Xor, coord, ones);
+                let m = self.s.m.select(c, neg, inv, coord);
+                let oob = border_one.then(|| self.s.m.cmp(c, pred::IUGE, m, size));
+                (m, oob)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// The first texel of a gather's footprint along an axis of `size`
+    /// texels at float coordinate `f`: `floor(u × size − 0.5)` (or
+    /// `floor(u − 0.5)` when `unnormalized`) with the product exact and
+    /// rounded to 1/256 of a texel, half up, as the hardware does, i.e.
+    /// `(floor(u × mul × 512) − 255) >> 9`, in 64-bit integers.
+    ///
+    /// For periodic modes (`WRAP`, `MIRROR`) exact integer-period reduction
+    /// (`u - trunc(u)` or `u - 2 * trunc(u * 0.5)`) keeps the coordinate in
+    /// `(-1, 1)` or `(-2, 2)` without losing precision; NaN (and ±∞ for
+    /// periodic modes) maps to 0. For clamp/border modes `f` is clamped to
+    /// `[-64, 64]` (or `[-65536, 65536]` when unnormalized), far enough past
+    /// any 6-bit texel offset.
+    fn gather_first(&mut self, f: V, size: V, mode: u32, unnormalized: bool) -> V {
+        let c = self.cur;
         let fz = self.s.m.f32(0);
-        let f = self.s.m.select(c, num, f, fz);
-        let (lo, hi) = (
-            self.s.m.f32((-2.0f32).to_bits()),
-            self.s.m.f32(2.0f32.to_bits()),
-        );
-        let f = self.binary(35, f, lo);
-        let f = self.binary(36, f, hi);
+        let (f, mul_size) = if unnormalized {
+            let num = self.s.m.cmp(c, pred::OEQ, f, f);
+            let f = self.s.m.select(c, num, f, fz);
+            let (lo, hi) = (
+                self.s.m.f32((-65536.0f32).to_bits()),
+                self.s.m.f32(65536.0f32.to_bits()),
+            );
+            let f = self.binary(35, f, lo);
+            let f = self.binary(36, f, hi);
+            (f, self.s.m.i32(1))
+        } else if mode == 0 {
+            // Exact period-1 reduction: `f - trunc(f)` is bit-exact in IEEE
+            // 754 for every finite float and maps ±∞ / NaN to NaN -> 0.
+            let q = self.unary(29, f);
+            let red = self.s.m.bin(c, Bin::Sub, f, q);
+            let num = self.s.m.cmp(c, pred::OEQ, red, red);
+            (self.s.m.select(c, num, red, fz), size)
+        } else if mode == 1 {
+            // Exact period-2 reduction: `f - 2 * trunc(f * 0.5)` is bit-exact
+            // in IEEE 754 for every finite float and lies in `(-2, 2)`.
+            let half = self.s.m.f32(0.5f32.to_bits());
+            let h = self.s.m.bin(c, Bin::Mul, f, half);
+            let q = self.unary(29, h);
+            let two_q = self.s.m.bin(c, Bin::Add, q, q);
+            let red = self.s.m.bin(c, Bin::Sub, f, two_q);
+            let num = self.s.m.cmp(c, pred::OEQ, red, red);
+            (self.s.m.select(c, num, red, fz), size)
+        } else {
+            let num = self.s.m.cmp(c, pred::OEQ, f, f);
+            let f = self.s.m.select(c, num, f, fz);
+            let (lo, hi) = (
+                self.s.m.f32((-64.0f32).to_bits()),
+                self.s.m.f32(64.0f32.to_bits()),
+            );
+            let f = self.binary(35, f, lo);
+            let f = self.binary(36, f, hi);
+            (f, size)
+        };
         let x = self.as_int(f);
         // u = m × 2^(e − 150), e at least 1 (denormals).
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -8181,28 +8398,150 @@ impl<'a> Lower<'a> {
         let bit = self.s.m.select(c, normal, implicit, zero);
         let m = self.s.m.bin(c, Bin::Or, m, bit);
         let e = self.s.m.select(c, normal, e, one);
-        // u × size × 512 = m × size × 2^(e − 141); |u| ≤ 2 keeps e ≤ 128.
+        // u × mul_size × 512 = m × mul_size × 2^(e − 141).
         let k141 = k(self, 141);
         let shift = self.s.m.bin(c, Bin::Sub, k141, e);
-        let k63 = k(self, 63);
-        let far = self.s.m.cmp(c, pred::SGT, shift, k63);
-        let shift = self.s.m.select(c, far, k63, shift);
         let i64t = self.s.m.int(64);
         self.s.flags |= flags::INT64;
         let m = self.s.m.cast(c, Cast::ZExt, m, i64t);
-        let n = self.s.m.cast(c, Cast::ZExt, size, i64t);
+        let n = self.s.m.cast(c, Cast::ZExt, mul_size, i64t);
         let p = self.s.m.bin(c, Bin::Mul, m, n);
         let z64 = self.s.m.int_const(i64t, 0);
         let neg = self.s.m.bin(c, Bin::Sub, z64, p);
         let negative = self.s.m.cmp(c, pred::SLT, x, zero);
         let p = self.s.m.select(c, negative, neg, p);
-        let shift = self.s.m.cast(c, Cast::ZExt, shift, i64t);
-        let g = self.s.m.bin(c, Bin::AShr, p, shift);
+        let k63 = k(self, 63);
+        let far = self.s.m.cmp(c, pred::SGT, shift, k63);
+        let g = if unnormalized {
+            // `|f| <= 65536` gives `e <= 143`, so `shift` may be `-2` or `-1`.
+            let left_shift = self.s.m.cmp(c, pred::SLT, shift, zero);
+            let rsh = self.s.m.select(c, far, k63, shift);
+            let rsh = self.s.m.select(c, left_shift, zero, rsh);
+            let rsh = self.s.m.cast(c, Cast::ZExt, rsh, i64t);
+            let right_val = self.s.m.bin(c, Bin::AShr, p, rsh);
+            let neg_sh = self.s.m.bin(c, Bin::Sub, zero, shift);
+            let lsh = self.s.m.select(c, left_shift, neg_sh, zero);
+            let lsh = self.s.m.cast(c, Cast::ZExt, lsh, i64t);
+            let left_val = self.s.m.bin(c, Bin::Shl, p, lsh);
+            self.s.m.select(c, left_shift, left_val, right_val)
+        } else {
+            // `|f| <= 64` keeps `e <= 133`, so `shift >= 8`.
+            let shift = self.s.m.select(c, far, k63, shift);
+            let shift = self.s.m.cast(c, Cast::ZExt, shift, i64t);
+            self.s.m.bin(c, Bin::AShr, p, shift)
+        };
         let k255 = self.s.m.int_const(i64t, 255);
         let g = self.s.m.bin(c, Bin::Sub, g, k255);
         let k9 = self.s.m.int_const(i64t, 9);
         let g = self.s.m.bin(c, Bin::AShr, g, k9);
         self.s.m.cast(c, Cast::Trunc, g, self.s.t.i32)
+    }
+
+    /// Like [`Self::whole`], for a 16-bit float stored in the low (`!hi`) or
+    /// high (`hi`) half of `v` (`image_gather4_l(_o) ... a16`).
+    fn whole_f16(&self, v: Value, hi: bool, seen: &mut HashSet<(Value, bool)>) -> Option<bool> {
+        if !seen.insert((v, hi)) {
+            return Some(true);
+        }
+        let f16_whole = |bits: u32, half_hi: bool| -> Option<bool> {
+            let b = (bits >> if half_hi { 16 } else { 0 }) & 0xFFFF;
+            let e = (b >> 10) & 0x1F;
+            let m = b & 0x3FF;
+            if e == 0x1F {
+                return (m == 0).then_some(true);
+            }
+            let f = if e == 0 {
+                m as f32 * 2f32.powi(-24)
+            } else {
+                (1024 + m) as f32 * 2f32.powi(e as i32 - 25)
+            };
+            (f.fract() == 0.0).then_some(true)
+        };
+        let p = self.x.p;
+        if let Some(&(b, i)) = self.phi_at.get(&v) {
+            let mut never_nan = true;
+            for &arg in &p.blocks[b].phis[i].args {
+                never_nan &= self.whole_f16(arg, hi, seen)?;
+            }
+            return Some(never_nan);
+        }
+        let Some(&b) = self.def_block.get(&v) else {
+            let vgpr = p
+                .inputs
+                .iter()
+                .any(|&(r, x)| x == v && matches!(r, Reg::V(_)));
+            let io = self.x.io.inputs.iter().any(|i| i.0 == v);
+            return (vgpr && !io).then_some(true);
+        };
+        let (i, inst) = p.blocks[b]
+            .insts
+            .iter()
+            .enumerate()
+            .find(|(_, i)| i.writes.iter().any(|w| w.1 == v))?;
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        if f.omod != 0 || f.sdwa.is_some() || f.dpp.is_some() {
+            return None;
+        }
+        let mut never_nan = true;
+        if self.x.st.guards[b][i].is_some() {
+            let Some(Operand::Vector { reg, .. }) = f.dst else {
+                return None;
+            };
+            never_nan = self.whole_f16(inst.read(Reg::V(reg))?, hi, seen)?;
+        }
+        let mut src_f16 = |k: usize, src_hi: bool| -> Option<bool> {
+            match *f.src.get(k)? {
+                Operand::Vector { reg, .. } => {
+                    self.whole_f16(inst.read(Reg::V(reg))?, src_hi, seen)
+                }
+                Operand::Const(c) => f16_whole(crate::resource::inline(c)?, src_hi),
+                Operand::Literal(x) => f16_whole(x, src_hi),
+                _ => None,
+            }
+        };
+        let src_f32 = |k: usize| -> Option<bool> {
+            match *f.src.get(k)? {
+                Operand::Vector { reg, .. } => {
+                    self.whole(inst.read(Reg::V(reg))?, &mut HashSet::new())
+                }
+                Operand::Const(c) => {
+                    let x = f32::from_bits(crate::resource::inline(c)?);
+                    (x.is_infinite() || x.fract() == 0.0).then_some(true)
+                }
+                Operand::Literal(x) => {
+                    let x = f32::from_bits(x);
+                    (x.is_infinite() || x.fract() == 0.0).then_some(true)
+                }
+                _ => None,
+            }
+        };
+        let r = match inst.name() {
+            "v_cvt_f16_i16" | "v_cvt_f16_u16" if !hi => true,
+            "v_cvt_f16_f32" if !hi => src_f32(0)?,
+            "v_floor_f16" | "v_ceil_f16" | "v_trunc_f16" | "v_rndne_f16" if !hi => false,
+            "v_max_f16" | "v_min_f16" if !hi => {
+                src_f16(0, f.opsel & 1 != 0)? | src_f16(1, f.opsel & 2 != 0)?
+            }
+            "v_mov_b32" => src_f16(0, hi)?,
+            "v_cndmask_b32" => src_f16(0, hi)? & src_f16(1, hi)?,
+            "v_pack_b32_f16" => {
+                let k = usize::from(hi);
+                src_f16(k, f.opsel >> k & 1 != 0)?
+            }
+            "v_cvt_pkrtz_f16_f32" => src_f32(usize::from(hi))?,
+            "v_lshl_or_b32" if matches!(f.src.get(1), Some(Operand::Const(144))) => {
+                // `v_lshl_or_b32 dst, hi_half, 16, lo_half` (inline 16 = 128 + 16 = 144).
+                if hi {
+                    src_f16(0, false)?
+                } else {
+                    src_f16(2, false)?
+                }
+            }
+            _ => return None,
+        };
+        Some(r && never_nan)
     }
 
     /// Whether `v` holds, as a float, a whole number or an infinity in
