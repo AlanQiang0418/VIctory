@@ -1214,10 +1214,9 @@ pub enum Stride {
     Raw,
     /// RGBA32F elements.
     Typed,
-    /// Structured, elements of this many bytes: made a raw view of the same
-    /// bytes, as the runtime makes the title's structured views
-    /// (`victory_gpu::descriptor::host::raw_srv`; NVIDIA reads a structured
-    /// view by its own stride, whatever the shader's read).
+    /// Structured elements of this many bytes. A translated shader uses the
+    /// runtime's raw view of the same bytes. Original PC HLSL uses its
+    /// declared structured view.
     Structured(u32),
     /// Typed, elements in this format of this many bytes.
     Format(DXGI_FORMAT, u32),
@@ -1242,6 +1241,26 @@ impl Host {
         root: &ID3D12RootSignature,
         pso: &ID3D12PipelineState,
         d: &Dispatch,
+    ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_with_views(root, pso, d, false)
+    }
+
+    /// Runs original PC bytecode with descriptors matching its HLSL declarations.
+    pub fn dispatch_pc(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+    ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_with_views(root, pso, d, true)
+    }
+
+    fn dispatch_with_views(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        native_pc: bool,
     ) -> Result<Vec<Vec<u32>>, String> {
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
@@ -1583,7 +1602,13 @@ impl Host {
                     View::Buffer { data, stride } => {
                         let b = upload(data)?;
                         let (format, elements, stride, flags) = match stride {
-                            Stride::Raw => (
+                            Stride::Structured(bytes) if native_pc => (
+                                DXGI_FORMAT_UNKNOWN,
+                                data.len() * 4 / bytes as usize,
+                                bytes,
+                                D3D12_BUFFER_SRV_FLAG_NONE,
+                            ),
+                            Stride::Raw | Stride::Structured(_) => (
                                 DXGI_FORMAT_R32_TYPELESS,
                                 data.len(),
                                 0,
@@ -1594,12 +1619,6 @@ impl Host {
                                 data.len() / 4,
                                 0,
                                 D3D12_BUFFER_SRV_FLAG_NONE,
-                            ),
-                            Stride::Structured(_) => (
-                                DXGI_FORMAT_R32_TYPELESS,
-                                data.len(),
-                                0,
-                                D3D12_BUFFER_SRV_FLAG_RAW,
                             ),
                             Stride::Format(f, bytes) => (
                                 f,
