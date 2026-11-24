@@ -8532,11 +8532,29 @@ impl<'a> Lower<'a> {
             }
             "v_cvt_pkrtz_f16_f32" => src_f32(usize::from(hi))?,
             "v_lshl_or_b32" if matches!(f.src.get(1), Some(Operand::Const(144))) => {
-                // `v_lshl_or_b32 dst, hi_half, 16, lo_half` (inline 16 = 128 + 16 = 144).
-                if hi {
-                    src_f16(0, false)?
-                } else {
+                if !hi {
                     src_f16(2, false)?
+                } else {
+                    // (src0 << 16) | src2: both words can contribute LOD bits.
+                    let bits = |k: usize| {
+                        let op = *f.src.get(k)?;
+                        let reg = match op {
+                            Operand::Vector { reg, .. } => Reg::V(reg),
+                            Operand::Scalar { code: NULL, .. } => return Some(0),
+                            Operand::Scalar { code, .. } => Reg::S(code),
+                            _ => return crate::resource::lane_of(op),
+                        };
+                        let Val::I32(word) = self.vals.get(&inst.read(reg)?)? else {
+                            return None;
+                        };
+                        self.s.m.int_value(*word).map(|x| x as u32)
+                    };
+                    let slice = bits(2)?;
+                    if slice >> 16 == 0 {
+                        src_f16(0, false)?
+                    } else {
+                        f16_whole((bits(0)? << 16) | slice, true)?
+                    }
                 }
             }
             _ => return None,

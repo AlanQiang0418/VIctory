@@ -1212,6 +1212,51 @@ fn gathers_at_a_level_support_a16_d16_unorm_and_2d_arrays() {
     assert!(ran > 0, "no device");
 }
 
+#[test]
+fn a16_array_gather_checks_both_inputs_to_a_shift_or_packed_level() {
+    let gather = |lod: &[u32], operands: &[u32]| {
+        let mut code = vec![
+            0xBE84_0300, // s_mov_b32 s4, s0 (descriptor table)
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 64
+            0xB008_01B6, // transparent black border
+            0xBE89_03FF,
+            0x00C0_0000, // levels 0..12
+            0xBE8A_03FF,
+            0x0450_0000, // mip filtering
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0x7E2C_0280, // v_mov_b32 v22, 0 (u, v)
+            0x3420_0099, // v_lshlrev_b32 v16, 25, v0 (bit 25 set in odd lanes)
+        ];
+        code.extend_from_slice(lod);
+        code.push(0xD76F_0017); // v_lshl_or_b32 v23, v15, 16, src2
+        code.extend_from_slice(operands);
+        code.extend(mimg_gather(0x44, 1, 5, false, true, false, 4, 22, 12, 8));
+        code.extend([0xE078_0000, 0x800A_0400, 0xBF81_0000]); // store v[4:7]; s_endpgm
+        build_raw_gather(&code)
+    };
+    let one = [0x7E1E_02FF, 0x0000_3C00]; // v_mov_b32 v15, 0x3c00 (f16 1.0)
+    let lane = [
+        0x7E1E_0D00, // v_cvt_f32_u32 v15, v0
+        0x7E1E_150F, // v_cvt_f16_f32 v15, v15
+    ];
+    let literal = |word| [0x03FD_210F, word];
+    gather(&lane, &literal(0x0000_3C00)).expect("slice 1, per-lane whole LOD");
+    gather(&one, &literal(0x8000_3C00)).expect("slice 1, LOD -1");
+    // Bit 25 changes the packed LOD from 1.0 to 1.5.
+    let fractional = literal(0x0200_3C00);
+    let per_lane = [0x0441_210F]; // src2 is v16: odd lanes get LOD 1.5
+    for src2 in [fractional.as_slice(), per_lane.as_slice()] {
+        let Err(crate::ShaderError::Unsupported { what, .. }) = gather(&one, src2) else {
+            panic!("accepted a fractional packed LOD");
+        };
+        assert_eq!(what, "a gather at a level that may not be whole");
+    }
+}
+
 /// Unsupported sampler features (half-border, custom border on a border mode,
 /// fractional bias or LOD limits, reduction filter, unorm+wrap, non-whole a16
 /// LOD) remain refused cleanly.
