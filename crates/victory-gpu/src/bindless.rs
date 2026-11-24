@@ -640,7 +640,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let srv: [[u32; 10]; 2] = [[0, 1, 0x1688, 0, 0, 0, 16, 16, 0, 0], [39, 1, 0x1688, 0, 0, 0, 64, 0, 1, 0]];
         let uav: [[u32; 10]; 2] = [[0, 1, 0, 0, 16, 16, 0, 0, 0, 0], [39, 1, 0, 0, 64, 0, 0, 0, 1, 0]];
         for (read, write, what) in [(0, 1, "a structured view read"), (1, 0, "a structured unordered view read and written")] {
-            let Some(words) = add_through(&srv[read], &uav[write]) else {
+            let Some(words) = dispatch_through(&srv[read], &uav[write], ADD) else {
                 return; // no host GPU here
             };
             for (i, &v) in words.iter().enumerate() {
@@ -649,10 +649,34 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
     }
 
-    /// What [`ADD`] leaves through a view `uav` of a buffer holding 0,
+    #[test]
+    fn structured_views_report_their_element_count() {
+        // Both title views describe 16 uint4 elements in 256 bytes.
+        let srv = [0, 1, 0x1688, 0, 0, 0, 16, 16, 0, 0];
+        let uav = [0, 1, 0, 0, 16, 16, 0, 0, 0, 0];
+        let source = r#"
+#define RS "DescriptorTable(SRV(t0), UAV(u0))"
+StructuredBuffer<uint4> src : register(t0);
+RWStructuredBuffer<uint4> dst : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    if (id.x == 0) {
+        uint ns, ss, nd, sd;
+        src.GetDimensions(ns, ss);
+        dst.GetDimensions(nd, sd);
+        dst[0] = uint4(ns, ss, nd, sd);
+    }
+}
+"#;
+        let words = dispatch_through(&srv, &uav, source).expect("requires a D3D12 device");
+        assert_eq!(&words[..4], &[16, 16, 16, 16], "SRV count/stride, UAV count/stride");
+    }
+
+    /// What the compute shader leaves through a view `uav` of a buffer holding 0,
     /// 0x10000, 0x20000, ... with a view `srv` of one holding 1000, 1001, ...
     /// (64 dwords each).
-    fn add_through(srv: &[u32; 10], uav: &[u32; 10]) -> Option<Vec<u32>> {
+    fn dispatch_through(srv: &[u32; 10], uav: &[u32; 10], source: &str) -> Option<Vec<u32>> {
         let host = crate::host::host()?;
         let null = std::ptr::null();
         let (src, dst) = (resource(1, 256, 1, 0, 1), resource(1, 256, 1, 0, 1));
@@ -682,7 +706,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         crate::descriptor::create_srv(null, src, srv, slot(0));
         crate::descriptor::create_uav(null, dst, null, uav, slot(1));
         let heap_host = title_heap.host().expect("a host view heap");
-        let (root, pso) = compile(ADD);
+        let (root, pso) = compile(source);
         let list = host.new_list().unwrap();
         // SAFETY: an open list, live objects of ours.
         unsafe {
