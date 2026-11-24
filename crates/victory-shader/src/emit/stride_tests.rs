@@ -243,6 +243,10 @@ fn table_buffer_descriptor_word_two_counts_records() {
     let structured = Structured(12);
     let cases = [
         ("indexed SRV", &indexed[..], Structured(4), false, [48, data[1]]),
+        ("8-byte indexed SRV", &indexed[..], Structured(8), false, [24, data[2]]),
+        ("12-byte indexed SRV", &indexed[..], Structured(12), false, [16, data[3]]),
+        ("16-byte indexed SRV", &indexed[..], Structured(16), false, [12, data[4]]),
+        ("24-byte indexed SRV", &indexed[..], Structured(24), false, [8, data[6]]),
         ("offset SRV", &offset[..], structured, false, [16, data[3]]),
         ("scalar SRV", &scalar[..], structured, false, [16, data[3]]),
         ("raw SRV", &offset[..], Raw, false, [192, data[3]]),
