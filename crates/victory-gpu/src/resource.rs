@@ -1191,7 +1191,15 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
     let mut castable_formats = if d.flags & DEPTH == 0 { castable(d.format) } else { Vec::new() };
     let mut initial = crate::host::legal_for(d.flags, crate::host::texture_state(state));
     if !castable_formats.is_empty()
-        && let Ok(device) = host.device.cast::<ID3D12Device10>()
+        && let Ok(device) = host.device.cast::<ID3D12Device10>().inspect_err(|e| {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::info!(
+                    error = %e,
+                    "ID3D12Device10 unavailable, creating textures without a castable format list"
+                );
+            });
+        })
     {
         // SAFETY: the description has the host layout (checked size).
         let p = unsafe { std::ptr::from_ref(d).cast::<D3D12_RESOURCE_DESC>().read_unaligned() };
