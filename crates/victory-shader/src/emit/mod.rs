@@ -72,8 +72,8 @@
 //!   `i` the host keeps at the byte stride of the buffer view at heap
 //!   index `i`.
 //! * **D16 image reads** use the same table's upper bits for the bound
-//!   texture's rounding mode. Normalized texels round to nearest even,
-//!   while the floating-point path uses the host's legacy truncation.
+//!   texture's rounding mode. Normalized texels round to nearest even.
+//!   Floating-point texels round toward zero regardless of the host.
 //! * **Constant buffers in the heap** (added 2026-11-24): scalar buffer
 //!   loads through a descriptor taken from the resource heap itself (root
 //!   type 5, so no used-resource entry) read a raw buffer view, not a

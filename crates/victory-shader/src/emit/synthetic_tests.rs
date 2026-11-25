@@ -410,6 +410,7 @@ fn d16_image_load_rounds_normalized_texels_to_nearest() {
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let mut failures = Vec::new();
+    let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
             eprintln!("no SM 6.6 {label} device; skipped");
@@ -521,7 +522,9 @@ fn d16_image_load_rounds_normalized_texels_to_nearest() {
                 eprintln!("{label} RGBA{bits}_{name}: all {count} texels matched");
             }
         }
+        ran += 1;
     }
+    assert!(ran > 0, "no SM 6.6 device ran the image loads");
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
@@ -648,6 +651,7 @@ fn d16_point_and_linear_samples_round_correctly() {
                 "{label} point sample {format:?}, stored code {code:#x}"
             );
         }
+        eprintln!("{label}: four point-sample edge cases and the linear control matched");
         ran += 1;
     }
     assert!(ran > 0, "no SM 6.6 device ran the samples");
