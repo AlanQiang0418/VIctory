@@ -1527,4 +1527,29 @@ fn gathers_at_a_level_a16_packed_lshl_or_validates_src2_high_half() {
     const_neg_one.extend(v_lshl_or_16(13, 256 + 16, 255));
     const_neg_one.push(0x0000_3C00);
     build_packed(&const_neg_one).expect("constant -1.0f16 LOD with zero high half in src2");
+
+    // ANDing a loaded word with itself keeps every bit, including bit 25
+    // which can turn the high-half LOD from 1.0 into 1.5.
+    let mut repeated = vec![0x3620_1B0D]; // v_and_b32 v16, v13, v13
+    repeated.extend(v_lshl_or_16(13, 256 + 14, 256 + 16));
+    let err = build_packed(&repeated).expect_err("repeated operand leaves the high half unknown");
+    assert!(err.to_string().contains("may not be whole"), "{err}");
+    let mut masked = vec![0x361A_1AFF, 0x0000_FFFF]; // v_and_b32 v13, 0xffff, v13
+    masked.extend_from_slice(&repeated);
+    build_packed(&masked).expect("repeated masked operand has a zero upper half");
+
+    // ORing in bit 0 around a loop keeps the upper half from its entry.
+    let mut loop_word = vec![
+        0x7E20_0280, // v_mov_b32 v16, 0
+        0xBE98_0382, // s_mov_b32 s24, 2
+        0x3820_2081, // v_or_b32 v16, 1, v16
+        0x8098_8118, // s_sub_u32 s24, s24, 1
+        0xBF07_8018, // s_cmp_lg_u32 s24, 0
+        0xBF85_FFFC, // s_cbranch_scc1 to v_or_b32
+    ];
+    loop_word.extend(v_lshl_or_16(13, 256 + 14, 256 + 16));
+    build_packed(&loop_word).expect("loop preserves the initially zero upper half");
+    loop_word[0] = 0x7E20_030D; // v_mov_b32 v16, v13 (loaded word)
+    let err = build_packed(&loop_word).expect_err("loop preserves unknown input bits");
+    assert!(err.to_string().contains("may not be whole"), "{err}");
 }

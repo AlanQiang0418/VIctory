@@ -8567,7 +8567,7 @@ impl<'a> Lower<'a> {
                 if hi {
                     if let (Some(c0), Some(c2)) = (const_u32(0), const_u32(2)) {
                         f16_whole((c0 << 16) | c2, true)?
-                    } else if self.high16_zero_op(inst, f.src.get(2)?, &mut HashSet::new()) {
+                    } else if self.high16_zero_op(inst, f.src.get(2)?, &mut HashMap::new()) {
                         src_f16(0, false, false)?
                     } else {
                         return None;
@@ -8582,33 +8582,45 @@ impl<'a> Lower<'a> {
     }
 
     /// Whether bits `[31:16]` of operand `op` are provably zero in every lane.
-    fn high16_zero_op(&self, inst: &Inst, op: &Operand, seen: &mut HashSet<Value>) -> bool {
+    fn high16_zero_op(&self, inst: &Inst, op: &Operand, known: &mut HashMap<Value, bool>) -> bool {
         match *op {
             Operand::Const(c) => crate::resource::inline(c).is_some_and(|x| x >> 16 == 0),
             Operand::Literal(x) => x >> 16 == 0,
             Operand::Vector { reg, .. } => inst
                 .read(Reg::V(reg))
-                .is_some_and(|v| self.high16_zero(v, seen)),
+                .is_some_and(|v| self.high16_zero(v, known)),
             Operand::Scalar { code, .. } if code != NULL => inst
                 .read(Reg::S(code))
-                .is_some_and(|v| self.high16_zero(v, seen)),
+                .is_some_and(|v| self.high16_zero(v, known)),
             Operand::Scalar { .. } => true,
             _ => false,
         }
     }
 
     /// Whether bits `[31:16]` of SSA value `v` are provably zero in every lane.
-    fn high16_zero(&self, v: Value, seen: &mut HashSet<Value>) -> bool {
-        if !seen.insert(v) {
-            return true;
+    fn high16_zero(&self, v: Value, known: &mut HashMap<Value, bool>) -> bool {
+        if let Some(&zero) = known.get(&v) {
+            return zero;
         }
-        let p = self.x.p;
-        if let Some(&(b, i)) = self.phi_at.get(&v) {
-            return p.blocks[b].phis[i]
+        let zero = if let Some(&(b, i)) = self.phi_at.get(&v) {
+            // Assume the loop-carried value is zero in its upper half, then
+            // prove it for every incoming edge. Intermediate results depend
+            // on this assumption and are local to this phi.
+            let mut incoming = known.clone();
+            incoming.insert(v, true);
+            self.x.p.blocks[b].phis[i]
                 .args
                 .iter()
-                .all(|&arg| self.high16_zero(arg, seen));
-        }
+                .all(|&arg| self.high16_zero(arg, &mut incoming))
+        } else {
+            self.high16_zero_inst(v, known)
+        };
+        known.insert(v, zero);
+        zero
+    }
+
+    fn high16_zero_inst(&self, v: Value, known: &mut HashMap<Value, bool>) -> bool {
+        let p = self.x.p;
         let Some(&b) = self.def_block.get(&v) else {
             return false;
         };
@@ -8639,56 +8651,56 @@ impl<'a> Lower<'a> {
                     let Some(old) = inst.read(Reg::V(reg)) else {
                         return false;
                     };
-                    if !self.high16_zero(old, seen) {
+                    if !self.high16_zero(old, known) {
                         return false;
                     }
                 }
                 match inst.name() {
-                    "v_mov_b32" => f.src.first().is_some_and(|op| self.high16_zero_op(inst, op, seen)),
+                    "v_mov_b32" => f.src.first().is_some_and(|op| self.high16_zero_op(inst, op, known)),
                     "v_and_b32" | "v_min_u32" => f
                         .src
                         .iter()
                         .take(2)
-                        .any(|op| self.high16_zero_op(inst, op, seen)),
+                        .any(|op| self.high16_zero_op(inst, op, known)),
                     "v_or_b32" | "v_xor_b32" | "v_cndmask_b32" => {
                         f.src.len() >= 2
                             && f.src
                                 .iter()
                                 .take(2)
-                                .all(|op| self.high16_zero_op(inst, op, seen))
+                                .all(|op| self.high16_zero_op(inst, op, known))
                     }
                     "v_and_or_b32" => {
                         f.src.len() >= 3
                             && f.src
                                 .iter()
                                 .take(2)
-                                .any(|op| self.high16_zero_op(inst, op, seen))
-                            && self.high16_zero_op(inst, &f.src[2], seen)
+                                .any(|op| self.high16_zero_op(inst, op, known))
+                            && self.high16_zero_op(inst, &f.src[2], known)
                     }
                     "v_lshrrev_b32" => {
                         const_u32(f.src.first()).is_some_and(|s| (s & 31) >= 16)
-                            || f.src.get(1).is_some_and(|op| self.high16_zero_op(inst, op, seen))
+                            || f.src.get(1).is_some_and(|op| self.high16_zero_op(inst, op, known))
                     }
                     "v_bfe_u32" => const_u32(f.src.get(2)).is_some_and(|w| (w & 31) <= 16),
                     _ => false,
                 }
             }
             Fields::Sop { src, .. } => match inst.name() {
-                "s_mov_b32" => src.first().is_some_and(|op| self.high16_zero_op(inst, op, seen)),
+                "s_mov_b32" => src.first().is_some_and(|op| self.high16_zero_op(inst, op, known)),
                 "s_and_b32" | "s_min_u32" => src
                     .iter()
                     .take(2)
-                    .any(|op| self.high16_zero_op(inst, op, seen)),
+                    .any(|op| self.high16_zero_op(inst, op, known)),
                 "s_or_b32" | "s_xor_b32" | "s_cselect_b32" => {
                     src.len() >= 2
                         && src
                             .iter()
                             .take(2)
-                            .all(|op| self.high16_zero_op(inst, op, seen))
+                            .all(|op| self.high16_zero_op(inst, op, known))
                 }
                 "s_lshr_b32" => {
                     const_u32(src.get(1)).is_some_and(|s| (s & 31) >= 16)
-                        || src.first().is_some_and(|op| self.high16_zero_op(inst, op, seen))
+                        || src.first().is_some_and(|op| self.high16_zero_op(inst, op, known))
                 }
                 "s_bfe_u32" => const_u32(src.get(1)).is_some_and(|spec| ((spec >> 16) & 0x7F) <= 16),
                 _ => false,
