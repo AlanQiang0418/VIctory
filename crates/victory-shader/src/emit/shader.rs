@@ -14,9 +14,11 @@ pub const SAMPLER_SPACE: u32 = 0;
 pub const ROOT_CBV_SPACE: u32 = 1;
 /// The root SRV slot (`t255` in [`ROOT_CBV_SPACE`], past every title root
 /// parameter) of the view table: dword `i` has the buffer stride or a
-/// texture rounding tag for view-heap index `i`.
+/// texture format tag for view-heap index `i`.
 pub const VIEW_STRIDES: u8 = 255;
 // The upper three bits tag textures. A tagged entry has a zero buffer stride.
+pub(super) const VIEW_UINT: u32 = 1 << 30;
+pub(super) const VIEW_SINT: u32 = VIEW_UINT | 1 << 29;
 pub(super) const VIEW_NORMALIZED: u32 = 1 << 31;
 pub(super) const VIEW_UNORM16: u32 = VIEW_NORMALIZED | 1 << 30;
 pub(super) const VIEW_SNORM16: u32 = VIEW_UNORM16 | 1 << 29;

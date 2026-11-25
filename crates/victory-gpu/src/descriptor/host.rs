@@ -41,7 +41,7 @@ pub(crate) struct HostHeap {
     pairs_end: u32,
     /// View heaps: the view table translated shaders read
     /// (`victory_shader::emit::VIEW_STRIDES`), a dword per title slot: the
-    /// byte stride of a buffer view or rounding tag of a texture. Mapped at the
+    /// byte stride of a buffer view or format tag of a texture. Mapped at the
     /// address kept beside it.
     view_table: Option<(ID3D12Resource, usize)>,
     /// View heaps: the view-mark table translated shaders read
@@ -386,12 +386,12 @@ impl HostHeap {
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the
     /// host cannot.
     pub(crate) fn make_at(&self, index: u32, view: &View) {
-        let (kept, mark, rounding) = make_marked(view, self.cpu(index));
+        let (kept, mark, tag) = make_marked(view, self.cpu(index));
         if kept.is_none() {
             null_for(view, self.cpu(index));
         }
         self.keep(index, kept.flatten());
-        self.write_view_entry(index, view_stride(view) | rounding);
+        self.write_view_entry(index, view_stride(view) | tag);
         self.set_mark(index, mark);
     }
 
@@ -672,12 +672,12 @@ impl HostHeap {
             // ran the host out of memory (run b2).
             let later = !for_draw && is_placed_texture(&view);
             made[index as usize] = if later { 0 } else { key };
-            let (kept, mark, rounding) = if later {
+            let (kept, mark, tag) = if later {
                 (None, None, 0)
             } else {
                 make_marked(&view, self.cpu(index))
             };
-            self.write_view_entry(index, view_stride(&view) | rounding);
+            self.write_view_entry(index, view_stride(&view) | tag);
             self.set_mark(index, mark);
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
@@ -1000,8 +1000,8 @@ fn make_marked(
     MARK.with(|m| m.set(None));
     let mut format = None;
     let kept = make(view, at, &mut format);
-    let rounding = format.map_or(0, victory_shader::emit::host::texture_rounding);
-    (kept, MARK.with(std::cell::Cell::take), rounding)
+    let tag = format.map_or(0, victory_shader::emit::host::texture_view_tag);
+    (kept, MARK.with(std::cell::Cell::take), tag)
 }
 
 /// The format the host can use for a shader (or unordered access) view of

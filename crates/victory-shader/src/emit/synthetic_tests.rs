@@ -367,7 +367,7 @@ fn permutes_read_the_lane_named_and_zero_from_lanes_left_out() {
 fn d16_image_load_rounds_normalized_texels_to_nearest() {
     use windows::Win32::Graphics::Dxgi::Common::*;
 
-    use super::host::texture_rounding;
+    use super::host::texture_view_tag;
     use super::semantics_tests::to_f16;
 
     // One group per row, one thread per texel, four D16 channels in two dwords.
@@ -440,7 +440,7 @@ fn d16_image_load_rounds_normalized_texels_to_nearest() {
                                 1,
                                 Root::View {
                                     srv: true,
-                                    data: vec![texture_rounding(format), 16, 4],
+                                    data: vec![texture_view_tag(format), 16, 4],
                                 },
                             ),
                         ],
@@ -599,7 +599,7 @@ fn d16_point_and_linear_samples_round_correctly() {
                     1,
                     Root::View {
                         srv: true,
-                        data: vec![super::host::texture_rounding(format), 16, 4],
+                        data: vec![super::host::texture_view_tag(format), 16, 4],
                     },
                 ));
             }
@@ -655,6 +655,178 @@ fn d16_point_and_linear_samples_round_correctly() {
         ran += 1;
     }
     assert!(ran > 0, "no SM 6.6 device ran the samples");
+}
+
+#[test]
+fn d16_integer_image_load_keeps_integer_channels() {
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    use super::host::texture_view_tag;
+
+    let shader = build(&[
+        0xBE84_0300, // s_mov_b32 s4, s0
+        0xBE85_0380, // s_mov_b32 s5, 0
+        0xF40C_0302,
+        0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+        0xF408_0A02,
+        0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+        0x7E02_0280, // v_mov_b32 v1, 0
+        0x3408_0083, // v_lshlrev_b32 v4, 3, v0
+        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+        0xF000_1F08,
+        0x8003_0200, // image_load v[2:3], v[0:1], s[12:19] dmask:0xf dim:2D d16
+        0xBF8C_3F70, // s_waitcnt vmcnt(0)
+        0xE074_1000,
+        0x800A_0204, // buffer_store_dwordx2 v[2:3], v4, s[40:43], 0 offen
+        0xBF81_0000, // s_endpgm
+    ])
+    .expect("lower a D16 image load");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        v.validate(&mut shader.dxil.clone())
+            .expect("validate a D16 image load");
+    }
+    assert_eq!(shader.root_srvs, [super::VIEW_STRIDES]);
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut failures = Vec::new();
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .expect("D16 image-load pipeline");
+        let read = |view: View<'_>, format| {
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![
+                            (
+                                0,
+                                Root::Constants(vec![0; shader.user_data_dwords().max(1) as usize]),
+                            ),
+                            (
+                                1,
+                                Root::View {
+                                    srv: true,
+                                    data: vec![texture_view_tag(format), 16, 4],
+                                },
+                            ),
+                        ],
+                        views: &[
+                            view,
+                            View::Buffer {
+                                data: &[0; 4],
+                                stride: Stride::Structured(16),
+                            },
+                            View::RawUav(64),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            assert_eq!(out[0].len(), 64, "{label}: readback length");
+            out.into_iter().next().unwrap()
+        };
+        // These FP32 subnormals look like small unsigned integers in their
+        // raw representation. A value-based integer guess corrupts them.
+        let floats = [[7, 0x0123, 0x8000, 0].map(f32::from_bits); 32];
+        assert_eq!(
+            read(
+                View::Texture(32, 1, &floats),
+                DXGI_FORMAT_R32G32B32A32_FLOAT
+            ),
+            [0; 64],
+            "{label}: FLOAT"
+        );
+        eprintln!("{label}: FLOAT subnormal control passed");
+
+        let cases = [
+            (
+                "RGBA8_UINT",
+                DXGI_FORMAT_R8G8B8A8_UINT,
+                1,
+                [0u32, 1, 133, 255],
+            ),
+            (
+                "RGBA8_SINT",
+                DXGI_FORMAT_R8G8B8A8_SINT,
+                1,
+                [-128, -1, 1, 127].map(|v| v as u32),
+            ),
+            (
+                "RGBA16_UINT",
+                DXGI_FORMAT_R16G16B16A16_UINT,
+                2,
+                [1, 0x7fff, 0x8000, 0xffff],
+            ),
+            (
+                "RGBA16_SINT",
+                DXGI_FORMAT_R16G16B16A16_SINT,
+                2,
+                [-32768, -24576, -1, 32767].map(|v| v as u32),
+            ),
+            (
+                "RGBA32_UINT",
+                DXGI_FORMAT_R32G32B32A32_UINT,
+                4,
+                [1, 65535, 70000, u32::MAX],
+            ),
+            (
+                "RGBA32_SINT",
+                DXGI_FORMAT_R32G32B32A32_SINT,
+                4,
+                [i32::MIN, -70000, 7, i32::MAX].map(|v| v as u32),
+            ),
+        ];
+        for (name, format, channel_bytes, channels) in cases {
+            let mut texel = Vec::new();
+            for value in channels {
+                texel.extend_from_slice(&value.to_le_bytes()[..channel_bytes]);
+            }
+            let pixels = texel.repeat(32);
+            let out = read(
+                View::TextureBits {
+                    size: [32, 1],
+                    format,
+                    data: &pixels,
+                    texel_bytes: (4 * channel_bytes) as u32,
+                },
+                format,
+            );
+            let [r, g, b, a] = channels.map(|value| {
+                if name.ends_with("_SINT") {
+                    u32::from((value as i32).clamp(-32768, 32767) as u16)
+                } else {
+                    value.min(65535)
+                }
+            });
+            let want = [r | g << 16, b | a << 16];
+            let wrong = out
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .filter(|&&got| got != want)
+                .count();
+            if wrong > 0 {
+                failures.push(format!(
+                    "{label} {name}: {wrong}/32 wrong; first texel {:08x?}, expected {want:08x?}",
+                    &out[..2]
+                ));
+            } else {
+                eprintln!("{label} {name}: all 32 texels matched");
+            }
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no SM 6.6 device ran the image loads");
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 #[test]

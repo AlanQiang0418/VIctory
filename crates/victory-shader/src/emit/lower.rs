@@ -12,7 +12,8 @@ use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{
-    Shader, VIEW_NORMALIZED, VIEW_SNORM16, VIEW_STRIDE_MASK, VIEW_STRIDES, VIEW_UNORM16, flags,
+    Shader, VIEW_NORMALIZED, VIEW_SINT, VIEW_SNORM16, VIEW_STRIDE_MASK, VIEW_STRIDES, VIEW_UINT,
+    VIEW_UNORM16, flags,
 };
 use crate::ShaderError;
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
@@ -7680,14 +7681,8 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, sign, half)
     }
 
-    fn image_d16(&mut self, h: V, channels: &[V], texel: bool) -> Result<Vec<V>, Why> {
+    fn image_d16(&mut self, entry: V, channels: &[V], texel: bool) -> Vec<V> {
         let c = self.cur;
-        let index = *self
-            .s
-            .view_index
-            .get(&h)
-            .ok_or("an image without a heap index")?;
-        let entry = self.view_entry(index);
         let flag = self.s.m.i32(VIEW_NORMALIZED);
         let normalized = self.s.m.cmp(c, pred::IUGE, entry, flag);
         // `legacyF32ToF16` alone truncates on Windows but rounds to nearest
@@ -7719,7 +7714,112 @@ impl<'a> Lower<'a> {
             nearest
         };
         let pairs: Vec<_> = nearest.into_iter().zip(truncate).collect();
-        Ok(self.end_guarded(norm, &pairs))
+        self.end_guarded(norm, &pairs)
+    }
+
+    /// Loads the same heap slot through a handle of the selected component
+    /// type. Only the matching branch may access the texture.
+    fn image_load_d16(
+        &mut self,
+        h: V,
+        kind: u32,
+        args: &mut [V],
+        channels: &[u32],
+    ) -> Result<Vec<V>, Why> {
+        let index = *self
+            .s
+            .view_index
+            .get(&h)
+            .ok_or("an image without a heap index")?;
+        let entry = self.view_entry(index);
+        let uint = self.s.m.i32(VIEW_UINT);
+        let sint = self.s.m.i32(VIEW_SINT);
+        let is_uint = self.s.m.cmp(self.cur, pred::EQ, entry, uint);
+        let is_sint = self.s.m.cmp(self.cur, pred::EQ, entry, sint);
+        let [unsigned, check_signed, signed, float, join] =
+            std::array::from_fn(|_| self.s.m.new_block());
+        self.s
+            .m
+            .terminate(self.cur, Term::CondBr(is_uint, unsigned, check_signed));
+        self.s
+            .m
+            .terminate(check_signed, Term::CondBr(is_sint, signed, float));
+
+        self.cur = float;
+        let r = self.s.op(
+            float,
+            "textureLoad.f32",
+            Attr::ReadOnly,
+            self.s.t.res_ret,
+            66,
+            args,
+        );
+        let values: Vec<_> = channels
+            .iter()
+            .map(|&ch| self.s.m.extract(float, r, ch))
+            .collect();
+        let floats = self.image_d16(entry, &values, true);
+        let float_end = self.cur;
+        self.s.m.terminate(float_end, Term::Br(join));
+
+        // Match the rasterizer ordering of the original UAV declaration.
+        let kind = if self.pops && kind & 0x1000 != 0 {
+            kind | 0x2000
+        } else {
+            kind
+        };
+        let ret = self
+            .s
+            .m
+            .named_struct("dx.types.ResRet.i32", vec![self.s.t.i32; 5]);
+        let mut load_integer = |block, signed| {
+            let component = if signed { 4 } else { 5 }; // DXIL I32 / U32
+            args[0] = self
+                .s
+                .heap_handle(block, index, false, true, (kind, 0x400 | component));
+            let r = self
+                .s
+                .op(block, "textureLoad.i32", Attr::ReadOnly, ret, 66, args);
+            let mask = self.s.m.i32(0xffff);
+            let top = self.s.m.i32(if signed { 0x7fff } else { 0xffff });
+            channels
+                .iter()
+                .map(|&ch| {
+                    let x = self.s.m.extract(block, r, ch);
+                    let over =
+                        self.s
+                            .m
+                            .cmp(block, if signed { pred::SGT } else { pred::IUGT }, x, top);
+                    let x = self.s.m.select(block, over, top, x);
+                    if signed {
+                        let bottom = self.s.m.i32((-32768i32) as u32);
+                        let under = self.s.m.cmp(block, pred::SLT, x, bottom);
+                        let x = self.s.m.select(block, under, bottom, x);
+                        self.s.m.bin(block, Bin::And, x, mask)
+                    } else {
+                        x
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let uints = load_integer(unsigned, false);
+        let sints = load_integer(signed, true);
+        self.s.m.terminate(unsigned, Term::Br(join));
+        self.s.m.terminate(signed, Term::Br(join));
+
+        self.cur = join;
+        Ok(floats
+            .into_iter()
+            .zip(uints)
+            .zip(sints)
+            .map(|((f, u), s)| {
+                let phi = self.s.m.phi(join, self.s.t.i32);
+                self.s
+                    .m
+                    .set_phi(phi, vec![(f, float_end), (u, unsigned), (s, signed)]);
+                phi
+            })
+            .collect())
     }
 
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -8042,8 +8142,13 @@ impl<'a> Lower<'a> {
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
-        let mut texel = op == 66 || op == 73;
-        let r = if sample {
+        let channels: Vec<_> = if op == 73 {
+            vec![0, 1, 2, 3]
+        } else {
+            (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
+        };
+        let mut xs: Vec<_> = if sample {
+            let mut texel = op == 73;
             let ss = self
                 .descriptors
                 .get(&(site, true))
@@ -8164,7 +8269,7 @@ impl<'a> Lower<'a> {
             }
             let mut args = vec![h, sh];
             args.extend(&cs);
-            match op {
+            let r = match op {
                 60 => {
                     if offset_word {
                         // DXIL takes immediate offsets in -8..=7; the
@@ -8347,6 +8452,21 @@ impl<'a> Lower<'a> {
                         &args,
                     )
                 }
+            };
+            let values: Vec<_> = channels
+                .iter()
+                .map(|&ch| self.s.m.extract(c, r, ch))
+                .collect();
+            if *d16 {
+                let index = *self
+                    .s
+                    .view_index
+                    .get(&h)
+                    .ok_or("an image without a heap index")?;
+                let entry = self.view_entry(index);
+                self.image_d16(entry, &values, texel)
+            } else {
+                values.into_iter().map(|x| self.as_int(x)).collect()
             }
         } else {
             let mut cs = vec![iu; 3];
@@ -8365,32 +8485,28 @@ impl<'a> Lower<'a> {
             let mut args = vec![h, mip];
             args.extend(&cs);
             args.extend([iu, iu, iu]);
-            self.s.op(
-                c,
-                "textureLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                66,
-                &args,
-            )
+            if *d16 {
+                self.image_load_d16(h, props.0, &mut args, &channels)?
+            } else {
+                let r = self.s.op(
+                    c,
+                    "textureLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    66,
+                    &args,
+                );
+                channels
+                    .into_iter()
+                    .map(|ch| {
+                        let x = self.s.m.extract(c, r, ch);
+                        self.as_int(x)
+                    })
+                    .collect()
+            }
         };
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
-        };
-        let channels: Vec<u32> = if op == 73 {
-            vec![0, 1, 2, 3]
-        } else {
-            (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
-        };
-        let channels: Vec<_> = channels
-            .into_iter()
-            .map(|ch| self.s.m.extract(c, r, ch))
-            .collect();
-        // shortcut: integer image formats would keep 16 integer bits.
-        let mut xs = if *d16 {
-            self.image_d16(h, &channels, texel)?
-        } else {
-            channels.into_iter().map(|x| self.as_int(x)).collect()
         };
         if *d16 {
             // Two channels per VGPR, low half first (an odd last high half 0).

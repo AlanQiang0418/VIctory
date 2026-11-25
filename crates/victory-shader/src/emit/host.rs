@@ -17,10 +17,33 @@ pub struct Host {
     pub device: ID3D12Device,
 }
 
-/// View-table tag for normalized texture reads that round D16 results to nearest.
-pub fn texture_rounding(format: DXGI_FORMAT) -> u32 {
-    use super::shader::{VIEW_NORMALIZED, VIEW_SNORM16, VIEW_UNORM16};
+/// View-table tag for normalized and integer texture reads.
+pub fn texture_view_tag(format: DXGI_FORMAT) -> u32 {
+    use super::shader::{VIEW_NORMALIZED, VIEW_SINT, VIEW_SNORM16, VIEW_UINT, VIEW_UNORM16};
     match format {
+        DXGI_FORMAT_R8_UINT
+        | DXGI_FORMAT_R8G8_UINT
+        | DXGI_FORMAT_R8G8B8A8_UINT
+        | DXGI_FORMAT_R10G10B10A2_UINT
+        | DXGI_FORMAT_R16_UINT
+        | DXGI_FORMAT_R16G16_UINT
+        | DXGI_FORMAT_R16G16B16A16_UINT
+        | DXGI_FORMAT_R32_UINT
+        | DXGI_FORMAT_R32G32_UINT
+        | DXGI_FORMAT_R32G32B32_UINT
+        | DXGI_FORMAT_R32G32B32A32_UINT
+        | DXGI_FORMAT_X24_TYPELESS_G8_UINT
+        | DXGI_FORMAT_X32_TYPELESS_G8X24_UINT => VIEW_UINT,
+        DXGI_FORMAT_R8_SINT
+        | DXGI_FORMAT_R8G8_SINT
+        | DXGI_FORMAT_R8G8B8A8_SINT
+        | DXGI_FORMAT_R16_SINT
+        | DXGI_FORMAT_R16G16_SINT
+        | DXGI_FORMAT_R16G16B16A16_SINT
+        | DXGI_FORMAT_R32_SINT
+        | DXGI_FORMAT_R32G32_SINT
+        | DXGI_FORMAT_R32G32B32_SINT
+        | DXGI_FORMAT_R32G32B32A32_SINT => VIEW_SINT,
         DXGI_FORMAT_R16_UNORM | DXGI_FORMAT_R16G16_UNORM | DXGI_FORMAT_R16G16B16A16_UNORM => {
             VIEW_UNORM16
         }
