@@ -7690,12 +7690,11 @@ impl<'a> Lower<'a> {
         let entry = self.view_entry(index);
         let flag = self.s.m.i32(VIEW_NORMALIZED);
         let normalized = self.s.m.cmp(c, pred::IUGE, entry, flag);
+        // `legacyF32ToF16` alone truncates on Windows but rounds to nearest
+        // under vkd3d-proton (NVIDIA).
         let truncate: Vec<_> = channels
             .iter()
-            .map(|&x| {
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[x])
-            })
+            .map(|&x| self.f16_toward_zero(x))
             .collect();
         let norm = self.begin_guarded(Some(normalized));
         let nearest: Vec<_> = channels
