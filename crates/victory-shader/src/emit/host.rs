@@ -18,6 +18,8 @@ pub struct Host {
 }
 
 /// View-table tag for normalized texture reads that round D16 results to nearest.
+/// sRGB reads linearize the texel before packing and keep truncating until
+/// console measurements define their rounding.
 pub fn texture_rounding(format: DXGI_FORMAT) -> u32 {
     use super::shader::{VIEW_NORMALIZED, VIEW_SNORM16, VIEW_UNORM16};
     match format {
@@ -34,29 +36,23 @@ pub fn texture_rounding(format: DXGI_FORMAT) -> u32 {
         | DXGI_FORMAT_R8G8_UNORM
         | DXGI_FORMAT_R8G8_SNORM
         | DXGI_FORMAT_R8G8B8A8_UNORM
-        | DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
         | DXGI_FORMAT_R8G8B8A8_SNORM
         | DXGI_FORMAT_B8G8R8A8_UNORM
-        | DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
         | DXGI_FORMAT_B8G8R8X8_UNORM
-        | DXGI_FORMAT_B8G8R8X8_UNORM_SRGB
         | DXGI_FORMAT_B5G6R5_UNORM
         | DXGI_FORMAT_B5G5R5A1_UNORM
         | DXGI_FORMAT_B4G4R4A4_UNORM
+        | DXGI_FORMAT_A4B4G4R4_UNORM
         | DXGI_FORMAT_R10G10B10A2_UNORM
         | DXGI_FORMAT_R24_UNORM_X8_TYPELESS
         | DXGI_FORMAT_BC1_UNORM
-        | DXGI_FORMAT_BC1_UNORM_SRGB
         | DXGI_FORMAT_BC2_UNORM
-        | DXGI_FORMAT_BC2_UNORM_SRGB
         | DXGI_FORMAT_BC3_UNORM
-        | DXGI_FORMAT_BC3_UNORM_SRGB
         | DXGI_FORMAT_BC4_UNORM
         | DXGI_FORMAT_BC4_SNORM
         | DXGI_FORMAT_BC5_UNORM
         | DXGI_FORMAT_BC5_SNORM
-        | DXGI_FORMAT_BC7_UNORM
-        | DXGI_FORMAT_BC7_UNORM_SRGB => VIEW_NORMALIZED,
+        | DXGI_FORMAT_BC7_UNORM => VIEW_NORMALIZED,
         _ => 0,
     }
 }
