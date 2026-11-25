@@ -329,7 +329,50 @@ impl PlacedFootprint {
         let (element, block) = element(self.format)?;
         let lines = u64::from(self.height).div_ceil(block) * u64::from(self.depth);
         let last = u64::from(self.width).div_ceil(block) * element;
-        Some(u64::from(self.row_pitch) * lines.saturating_sub(1) + last)
+        u64::from(self.row_pitch)
+            .checked_mul(lines.saturating_sub(1))?
+            .checked_add(last)
+    }
+
+    /// Byte ranges occupied by a copy in a validated footprint. Coordinates
+    /// are in destination texels; the copy size is in source storage blocks.
+    #[cfg(windows)]
+    pub(crate) fn copied_rows(
+        &self,
+        at: [u32; 3],
+        blocks: [u64; 3],
+    ) -> Option<impl Iterator<Item = (usize, usize)> + use<>> {
+        let (element, block) = element(self.format)?;
+        let [x, y, z] = at.map(u64::from);
+        let [width, height, depth] = blocks;
+        let rows = u64::from(self.height).div_ceil(block);
+        let pitch = u64::from(self.row_pitch);
+        let column = x / block * element;
+        let first_row = y / block;
+        let len = width * element;
+        if x % block != 0
+            || y % block != 0
+            || x / block + width > u64::from(self.width).div_ceil(block)
+            || column + len > pitch
+            || first_row + height > rows
+            || z + depth > u64::from(self.depth)
+        {
+            return None;
+        }
+        // A tightly packed rectangle of full rows is a single write per slice.
+        let (spans, span_len) = if len == pitch {
+            (1, len * height)
+        } else {
+            (height, len)
+        };
+        Some((z..z + depth).flat_map(move |slice| {
+            (0..spans).map(move |i| {
+                (
+                    ((slice * rows + first_row + i) * pitch + column) as usize,
+                    span_len as usize,
+                )
+            })
+        }))
     }
 }
 const _: () = assert!(size_of::<PlacedFootprint>() == 32);
@@ -1783,6 +1826,25 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn readback_spans_follow_compressed_rows_and_slices() {
+        let footprint = PlacedFootprint {
+            offset: 0,
+            format: 71, // BC1, eight bytes per 4x4 block
+            width: 10,
+            height: 12,
+            depth: 3,
+            row_pitch: 256,
+        };
+        let spans = footprint.copied_rows([4, 4, 1], [2, 2, 2]).unwrap();
+        assert_eq!(
+            spans.collect::<Vec<_>>(),
+            [(1032, 16), (1288, 16), (1800, 16), (2056, 16)]
+        );
+        assert!(footprint.copied_rows([4, 4, 1], [3, 2, 2]).is_none());
+    }
+
     /// A title buffer copied into a texture and the texture back into
     /// another title buffer, through our list and queue: the rows land at
     /// a footprint offset the host could not take directly (not 512-byte
@@ -1876,30 +1938,41 @@ mod tests {
             footprint: PlacedFootprint { offset, ..rows },
         };
         const AT: usize = 64;
+        const FULL: usize = AT + 1024;
         type Copy =
             extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
         let copy = slot::<Copy>(list, 0x80);
         let (image_at, source_at) = (subresource(image), placed(source, 0));
         copy(list, &image_at, 0, 0, 0, &source_at, null.cast());
+        copy(
+            list,
+            &placed(target, FULL as u64),
+            0,
+            0,
+            0,
+            &image_at,
+            null.cast(),
+        );
         let target_at = placed(target, AT as u64);
-        copy(list, &target_at, 0, 0, 0, &image_at, null.cast());
+        // Separate writes to the same footprint must preserve one another.
+        for x in [0u32, 2] {
+            let half = [x, 0, 0, x + 2, 4, 1];
+            copy(list, &target_at, x, 0, 0, &image_at, half.as_ptr().cast());
+        }
         slot::<extern "system" fn(This) -> HRESULT>(list, 0x48)(list);
         slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
 
         // Submissions are complete when they return.
-        for row in 0..4 {
-            let (from, to) = (row * 256, AT + row * 256);
-            assert_eq!(out[to..to + 16], bytes[from..from + 16], "row {row}");
-            if row < 3 {
-                assert!(
-                    out[to + 16..to + 256].iter().all(|&b| b == 0xEE),
-                    "pitch padding after row {row}"
-                );
+        let mut expected = vec![0xEE; out.len()];
+        for base in [AT, FULL] {
+            for row in 0..4 {
+                let (from, to) = (row * 256, base + row * 256);
+                expected[to..to + 16].copy_from_slice(&bytes[from..from + 16]);
             }
         }
-        assert!(out[..AT].iter().all(|&b| b == 0xEE), "before the footprint");
-        let end = AT + 3 * 256 + 16;
-        assert!(out[end..].iter().all(|&b| b == 0xEE), "after the footprint");
+        for (at, (&got, want)) in out.iter().zip(expected).enumerate() {
+            assert_eq!(got, want, "byte {at}");
+        }
     }
 
     #[test]

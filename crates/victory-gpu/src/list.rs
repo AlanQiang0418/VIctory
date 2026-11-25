@@ -595,10 +595,8 @@ extern "system" fn copy_texture_region(
 /// A title texture into a title buffer (a placed footprint), as titles
 /// read back what the GPU drew. The host texture is copied into a host
 /// buffer laid out as the footprint, at offset 0 (the host wants 512-byte
-/// aligned footprints; the title's may not be). That buffer starts as the
-/// title's bytes at submission, so the copy changes only its rows (pitch
-/// padding keeps the title's bytes), and goes into title memory once the
-/// list has run.
+/// aligned footprints; the title's may not be). Only the rows written by
+/// this command go back to title memory once the list has run.
 ///
 /// shortcut: later work of the same submission that reads the buffer on
 /// the GPU sees its bytes from before the copy: the title's copy of it on
@@ -635,12 +633,52 @@ fn copy_texture_to_buffer(
     let Some(title) = buffer_range(dst.resource, dst.footprint.offset, bytes) else {
         return;
     };
+    // Ask the host for the selected mip, array slice and plane's footprint.
+    // For a subresource location, the first DWORD of the union is its index.
+    let mut layout =
+        windows::Win32::Graphics::Direct3D12::D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+    let mut total = 0;
+    // SAFETY: a live resource and one output footprint.
+    unsafe {
+        host.device.GetCopyableFootprints(
+            &texture.GetDesc(),
+            src.footprint.offset as u32,
+            1,
+            0,
+            Some(&mut layout),
+            None,
+            None,
+            Some(&mut total),
+        );
+    }
+    if total == u64::MAX {
+        return;
+    }
+    let fp = layout.Footprint;
+    let Some((_, block)) = crate::resource::element(fp.Format.0 as u32) else {
+        return;
+    };
+    // SAFETY: the title's optional box is live while recording the copy.
+    let [width, height, depth] = match source_box.map(|b| unsafe { *b }) {
+        Some(b) if b.left < b.right && b.top < b.bottom && b.front < b.back => {
+            [b.right - b.left, b.bottom - b.top, b.back - b.front]
+        }
+        Some(_) => return,
+        None => [fp.Width, fp.Height, fp.Depth],
+    };
+    let blocks = [
+        u64::from(width).div_ceil(block),
+        u64::from(height).div_ceil(block),
+        u64::from(depth),
+    ];
+    let Some(rows) = dst.footprint.copied_rows(at, blocks) else {
+        return;
+    };
     let Some((buffer, data)) = host.shared_buffer(bytes) else {
         return;
     };
     crate::host::name(&buffer, || format!("list read back {bytes:#x}"));
     list.keep(&buffer);
-    list.defer_fill(data, title, bytes as usize);
     if crate::texture::title_written(texture) {
         crate::texture::upload(list, src.resource, texture);
     }
@@ -673,7 +711,7 @@ fn copy_texture_to_buffer(
             source_box,
         )
     };
-    list.defer_readback(title, data, bytes as usize);
+    list.defer_readback(title, data, rows);
 }
 
 #[allow(clippy::too_many_arguments)] // the method's own arguments

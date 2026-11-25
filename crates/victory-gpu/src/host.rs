@@ -1072,13 +1072,22 @@ impl HostList {
             .push(Step::GpuWrite(shadow.clone(), address, len));
     }
 
-    /// Copies `len` bytes the list's GPU commands write at host address
-    /// `src` (memory the list keeps) into title memory at `dst` once the
+    /// Copies the spans written in the list's retained host buffer at
+    /// `src` into the same offsets in title memory at `dst` once the
     /// list has run, before its bottom-of-pipe writes tell the title so.
-    pub(crate) fn defer_readback(&self, dst: *mut u8, src: *const u8, len: usize) {
-        self.deferred()
-            .readbacks
-            .push((dst as usize, src as usize, len));
+    pub(crate) fn defer_readback(
+        &self,
+        dst: *mut u8,
+        src: *const u8,
+        spans: impl Iterator<Item = (usize, usize)>,
+    ) {
+        self.deferred().readbacks.extend(spans.map(|(offset, len)| {
+            (
+                dst.wrapping_add(offset) as usize,
+                src.wrapping_add(offset) as usize,
+                len,
+            )
+        }));
     }
 
     /// Stores `what` (`bytes` of it) at `dst` once the list has run.
