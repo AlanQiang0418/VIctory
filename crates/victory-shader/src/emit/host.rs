@@ -1214,7 +1214,8 @@ pub enum Stride {
     Raw,
     /// RGBA32F elements.
     Typed,
-    /// Structured, elements of this many bytes.
+    /// Elements of this many bytes, which the test's stride table states;
+    /// the view itself is raw, as the GPU host makes it.
     Structured(u32),
     /// Typed, elements in this format of this many bytes.
     Format(DXGI_FORMAT, u32),
@@ -1592,11 +1593,18 @@ impl Host {
                                 0,
                                 D3D12_BUFFER_SRV_FLAG_NONE,
                             ),
-                            Stride::Structured(s) => (
-                                DXGI_FORMAT_UNKNOWN,
-                                data.len() * 4 / s as usize,
-                                s,
-                                D3D12_BUFFER_SRV_FLAG_NONE,
+                            // A raw view of the same bytes, as the GPU host
+                            // makes its buffer views (`victory-gpu`,
+                            // `descriptor::host`): the element size reaches
+                            // the shader through the stride table, and the
+                            // translated read is a byte-addressed load. A
+                            // structured view here has NVIDIA apply the
+                            // stride a second time (WARP does not; #1835).
+                            Stride::Structured(_) => (
+                                DXGI_FORMAT_R32_TYPELESS,
+                                data.len(),
+                                0,
+                                D3D12_BUFFER_SRV_FLAG_RAW,
                             ),
                             Stride::Format(f, bytes) => (
                                 f,
