@@ -1297,3 +1297,234 @@ fn gathers_at_a_level_still_refuse_unsupported_samplers() {
         assert_eq!(what, expected, "{name}");
     }
 }
+
+/// Null Texture2D SRVs return all zeros for `image_gather4_l(_o)` even with
+/// opaque border colors (`OpaqueWhite`, `OpaqueBlack` alpha), matching native
+/// `image_gather4_lz`.
+#[test]
+fn gathers_at_a_level_return_zero_on_null_texture_even_with_opaque_border() {
+    let base_w1 = 0x00C0_0000;
+    let base_w2 = 0x0450_0000;
+    let configs = [
+        ("wrap", 0, base_w1, base_w2, 0, 1u32),
+        ("mirror", 1 | (1 << 3), base_w1, base_w2, 0, 1),
+        ("clamp", 2 | (2 << 3), base_w1, base_w2, 0, 1),
+        ("mirror_once", 3 | (3 << 3), base_w1, base_w2, 0, 1),
+        ("border_trans_black", 6 | (6 << 3), base_w1, base_w2, 0, 8),
+        (
+            "border_opaque_black_rgb",
+            6 | (6 << 3),
+            base_w1,
+            base_w2,
+            1 << 30,
+            1,
+        ),
+        (
+            "border_opaque_black_alpha",
+            6 | (6 << 3),
+            base_w1,
+            base_w2,
+            1 << 30,
+            8,
+        ),
+        (
+            "border_opaque_white",
+            6 | (6 << 3),
+            base_w1,
+            base_w2,
+            2 << 30,
+            1,
+        ),
+        (
+            "mirror_once_border_white",
+            7 | (7 << 3),
+            base_w1,
+            base_w2,
+            2 << 30,
+            1,
+        ),
+        (
+            "mixed_wrap_x_border_y",
+            6 << 3,
+            base_w1,
+            base_w2,
+            2 << 30,
+            1,
+        ),
+        (
+            "bias_plus1_border_white",
+            6 | (6 << 3),
+            base_w1,
+            base_w2 | 0x0100,
+            2 << 30,
+            1,
+        ),
+    ];
+    let input: Vec<u32> = (0..32u32)
+        .flat_map(|k| {
+            let u = (k as f32 * 0.125) - 1.0;
+            let v = ((31 - k) as f32 * 0.125) - 1.0;
+            let off = ((k as i32 % 5) - 2) as u32 & 0x3F;
+            [off | (off << 8), u.to_bits(), v.to_bits(), k % 3]
+        })
+        .collect();
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut ran = 0;
+    for (backend, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {backend} device; skipped");
+            continue;
+        };
+        for &(label, w0, w1, w2, w3, dmask) in &configs {
+            let mut code = vec![
+                0xBE84_0300,
+                0xBE85_0380,
+                0xF40C_0302,
+                0xFA00_0000,
+                0xF408_0502,
+                0xFA00_0020,
+                0xF408_0A02,
+                0xFA00_0040,
+                0xBE88_03FF,
+                w0 | (2 << 6),
+                0xBE89_03FF,
+                w1,
+                0xBE8A_03FF,
+                w2,
+                0xBE8B_03FF,
+                w3,
+                0x3420_0084,
+                0x1628_00B0, // v_mul_u32_u24 v20, 48, v0 (12 dwords per lane)
+                0xBF8C_C07F,
+                0xE038_1000,
+                0x8005_0C10,
+                0xBF8C_3F70,
+                0x7E1E_0D0F, // v_cvt_f32_u32 v15, v15
+            ];
+            code.extend(mimg_gather(0x44, dmask, 1, false, false, false, 4, 13, 12, 8));
+            code.extend(mimg_gather(0x54, dmask, 1, false, false, false, 8, 12, 12, 8));
+            code.extend(mimg_gather(0x47, dmask, 1, false, false, false, 24, 13, 12, 8));
+            code.extend([
+                0xBF8C_3F70,
+                0xE078_1000,
+                0x800A_0414,
+                0xE078_1010,
+                0x800A_0814,
+                0xE078_1020,
+                0x800A_1814,
+                0xBF81_0000,
+            ]);
+            let shader = build_raw_gather(&code).unwrap_or_else(|e| panic!("{label}: {e}"));
+            let (root, pso) = host.compute_pipeline(&shader).expect("pipeline");
+            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[
+                            View::NullTexture,
+                            View::Buffer {
+                                data: &input,
+                                stride: Stride::Raw,
+                            },
+                            View::RawUav(32 * 12),
+                        ],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{backend}/{label}: dispatch failed: {e}"));
+            assert!(
+                out[0].iter().all(|&b| b == 0),
+                "{backend}/{label}: expected all zeros on null texture, got non-zero word"
+            );
+        }
+        ran += 1;
+    }
+    assert!(ran > 0, "no device");
+}
+
+/// `whole_f16` on `v_lshl_or_b32 dst, src0, 16, src2` checks `src2[31:16]`:
+/// a non-zero upper half in `src2` (literal or unmasked VGPR) that could alter
+/// the packed high-half f16 LOD is rejected, while a zero upper half (literal
+/// or masked VGPR) and constant `-1.0` remain accepted.
+#[test]
+fn gathers_at_a_level_a16_packed_lshl_or_validates_src2_high_half() {
+    // VOP3 v_lshl_or_b32 (0x36f): dst = (src0 << 16) | src2 (inline 16 = 144).
+    const fn v_lshl_or_16(vdst: u8, src0: u16, src2: u16) -> [u32; 2] {
+        [
+            0xD400_0000 | (0x36F << 16) | (vdst as u32),
+            (src0 as u32) | (144 << 9) | ((src2 as u32) << 18),
+        ]
+    }
+    let build_packed = |pack_insts: &[u32]| {
+        let mut code = vec![
+            0xBE84_0300,
+            0xBE85_0380,
+            0xF40C_0302,
+            0xFA00_0000,
+            0xF408_0502,
+            0xFA00_0020,
+            0xF408_0A02,
+            0xFA00_0040,
+            0xBE88_03FF,
+            2 | (2 << 3) | (2 << 6),
+            0xBE89_03FF,
+            0x00C0_0000,
+            0xBE8A_03FF,
+            0x0450_0000,
+            0xBE8B_0380,
+            0x3420_0084,
+            0xBF8C_C07F,
+            0xE038_1000,
+            0x8005_0C10, // buffer_load_dwordx4 v[12:15]
+            0xBF8C_3F70,
+            // v14 = whole f16 LOD from uint v15:
+            0x7E1E_0D0F, // v_cvt_f32_u32 v15, v15
+            0x7E1C_150F, // v_cvt_f16_f32 v14, v15
+        ];
+        code.extend_from_slice(pack_insts);
+        // image_gather4_l v[4:7], v[12:13], s[12:19], s[8:11] dim:2D_ARRAY a16
+        // v12 = (u, v), v13 = (slice, lod).
+        code.extend(mimg_gather(0x44, 1, 5, false, true, false, 4, 12, 12, 8));
+        code.extend([0xBF8C_3F70, 0xE078_1000, 0x800A_0410, 0xBF81_0000]);
+        build_raw_gather(&code)
+    };
+
+    // 1. Literal fractional upper half in src2 (`0x0200_3c00` OR `0x3c00 << 16` = 1.5) -> refused.
+    let mut lit_frac = vec![0x7E20_02FF, 0x0000_3C00]; // v16 = 0x3c00 (1.0f16)
+    lit_frac.extend(v_lshl_or_16(13, 256 + 16, 255));
+    lit_frac.push(0x0200_3C00);
+    let err = build_packed(&lit_frac).expect_err("literal fractional src2 high half must fail");
+    assert!(
+        err.to_string().contains("may not be whole"),
+        "unexpected error: {err}"
+    );
+
+    // 2. Per-lane unmasked VGPR src2 (v13 from buffer_load; unknown high half!) -> refused.
+    let per_lane_unmasked = v_lshl_or_16(13, 256 + 14, 256 + 13);
+    let err = build_packed(&per_lane_unmasked)
+        .expect_err("per-lane unmasked src2 high half must fail");
+    assert!(
+        err.to_string().contains("may not be whole"),
+        "unexpected error: {err}"
+    );
+
+    // 3. Per-lane whole LOD + masked src2 (`v_and_b32 v16, 0xFFFF, v13`) -> accepted.
+    let mut per_lane_masked = vec![
+        0x3620_1AFF,
+        0x0000_FFFF, // v_and_b32 v16, 0xFFFF, v13
+    ];
+    per_lane_masked.extend(v_lshl_or_16(13, 256 + 14, 256 + 16));
+    build_packed(&per_lane_masked).expect("per-lane whole LOD with zeroed src2 high half");
+
+    // 4. Constant -1.0f16 (`0xBC00`) with zero-high literal src2 (`0x0000_3C00`) -> accepted.
+    let mut const_neg_one = vec![0x7E20_02FF, 0x0000_BC00]; // v16 = 0xbc00 (-1.0f16)
+    const_neg_one.extend(v_lshl_or_16(13, 256 + 16, 255));
+    const_neg_one.push(0x0000_3C00);
+    build_packed(&const_neg_one).expect("constant -1.0f16 LOD with zero high half in src2");
+}

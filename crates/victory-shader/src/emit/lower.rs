@@ -8129,6 +8129,11 @@ impl<'a> Lower<'a> {
         let v_f = to_f32(self, a[base + 1]);
         let slice_f = (kind == 7).then(|| to_f32(self, a[base + 2]));
         let lod_f = to_f32(self, a[a.len() - 1]);
+        let d0 = self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims_t, 72, &[h, zero]);
+        let w0 = self.s.m.extract(c, d0, 0);
+        let is_null = self.s.m.cmp(c, pred::EQ, w0, zero);
         let level = if mip_filter {
             // Apply whole sampler LOD bias, clamp to the sampler's limits,
             // then to the view's last level.
@@ -8144,28 +8149,31 @@ impl<'a> Lower<'a> {
             let f = self.binary(35, f, lo);
             let f = self.binary(36, f, hi);
             let l = self.s.m.cast(c, Cast::FpToSi, f, i32t);
-            let d = self
-                .s
-                .op(c, "getDimensions", Attr::ReadOnly, dims_t, 72, &[h, zero]);
-            let levels = self.s.m.extract(c, d, 3);
+            let levels = self.s.m.extract(c, d0, 3);
             let last = self.s.m.bin(c, Bin::Sub, levels, one);
             let past = self.s.m.cmp(c, pred::SGT, l, last);
-            self.s.m.select(c, past, last, l)
+            let clamped = self.s.m.select(c, past, last, l);
+            self.s.m.select(c, is_null, zero, clamped)
         } else {
             zero
         };
-        let d = self
-            .s
-            .op(c, "getDimensions", Attr::ReadOnly, dims_t, 72, &[h, level]);
+        let d = if mip_filter {
+            self.s
+                .op(c, "getDimensions", Attr::ReadOnly, dims_t, 72, &[h, level])
+        } else {
+            d0
+        };
         let offset = has_offset.then(|| a[0]);
         let sizes = [
             self.s.m.extract(c, d, 0),
             self.s.m.extract(c, d, 1),
         ];
+        // Avoid URem by zero on null descriptors (whose dimensions are 0).
+        let safe_sizes = sizes.map(|s| self.s.m.select(c, is_null, one, s));
         let coord_f = [u_f, v_f];
         let mut first = [zero; 2];
         for (k, at) in [(0, 26), (1, 18)] {
-            first[k] = self.gather_first(coord_f[k], sizes[k], clamp[k], unnormalized);
+            first[k] = self.gather_first(coord_f[k], safe_sizes[k], clamp[k], unnormalized);
             if let Some(o) = offset {
                 // Bits at..at+5 of the offset word sign-extended.
                 let left = self.s.m.i32(at);
@@ -8181,10 +8189,10 @@ impl<'a> Lower<'a> {
         // and opaque black's alpha channel (1, ch 3) return 1.0 out of bounds.
         let border_one = border_type == 2 || (border_type == 1 && ch == 3);
         let next = first.map(|f| self.s.m.bin(c, Bin::Add, f, one));
-        let (x0, oob_x0) = self.gather_address(first[0], sizes[0], clamp[0], border_one);
-        let (x1, oob_x1) = self.gather_address(next[0], sizes[0], clamp[0], border_one);
-        let (y0, oob_y0) = self.gather_address(first[1], sizes[1], clamp[1], border_one);
-        let (y1, oob_y1) = self.gather_address(next[1], sizes[1], clamp[1], border_one);
+        let (x0, oob_x0) = self.gather_address(first[0], safe_sizes[0], clamp[0], border_one);
+        let (x1, oob_x1) = self.gather_address(next[0], safe_sizes[0], clamp[0], border_one);
+        let (y0, oob_y0) = self.gather_address(first[1], safe_sizes[1], clamp[1], border_one);
+        let (y1, oob_y1) = self.gather_address(next[1], safe_sizes[1], clamp[1], border_one);
         let iu = self.s.m.undef(i32t);
         let slice = if let Some(s) = slice_f {
             let num = self.s.m.cmp(c, pred::OEQ, s, s);
@@ -8205,6 +8213,7 @@ impl<'a> Lower<'a> {
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
         };
+        let zero_f = self.s.m.f32(0);
         let one_f = self.s.m.f32(1.0f32.to_bits());
         // Texels (x, y + 1), (x + 1, y + 1), (x + 1, y), (x, y).
         let mut xs = Vec::with_capacity(4);
@@ -8232,6 +8241,8 @@ impl<'a> Lower<'a> {
             if let Some(oob) = oob {
                 v = self.s.m.select(c, oob, one_f, v);
             }
+            // A D3D12 null SRV always returns zero regardless of border color.
+            v = self.s.m.select(c, is_null, zero_f, v);
             xs.push(if *d16 {
                 self.s
                     .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[v])
@@ -8491,13 +8502,30 @@ impl<'a> Lower<'a> {
             };
             never_nan = self.whole_f16(inst.read(Reg::V(reg))?, hi, seen)?;
         }
-        let mut src_f16 = |k: usize, src_hi: bool| -> Option<bool> {
+        let inline_bits = |c: u8, f16_inline: bool| -> Option<u32> {
+            if f16_inline && (240..=248).contains(&c) {
+                return Some(
+                    [
+                        0x3800, 0xB800, 0x3C00, 0xBC00, 0x4000, 0xC000, 0x4400, 0xC400, 0x3118,
+                    ][usize::from(c - 240)],
+                );
+            }
+            crate::resource::inline(c)
+        };
+        let mut src_f16 = |k: usize, src_hi: bool, f16_inline: bool| -> Option<bool> {
             match *f.src.get(k)? {
                 Operand::Vector { reg, .. } => {
                     self.whole_f16(inst.read(Reg::V(reg))?, src_hi, seen)
                 }
-                Operand::Const(c) => f16_whole(crate::resource::inline(c)?, src_hi),
+                Operand::Const(c) => f16_whole(inline_bits(c, f16_inline)?, src_hi),
                 Operand::Literal(x) => f16_whole(x, src_hi),
+                _ => None,
+            }
+        };
+        let const_u32 = |k: usize| -> Option<u32> {
+            match *f.src.get(k)? {
+                Operand::Const(c) => crate::resource::inline(c),
+                Operand::Literal(x) => Some(x),
                 _ => None,
             }
         };
@@ -8522,26 +8550,151 @@ impl<'a> Lower<'a> {
             "v_cvt_f16_f32" if !hi => src_f32(0)?,
             "v_floor_f16" | "v_ceil_f16" | "v_trunc_f16" | "v_rndne_f16" if !hi => false,
             "v_max_f16" | "v_min_f16" if !hi => {
-                src_f16(0, f.opsel & 1 != 0)? | src_f16(1, f.opsel & 2 != 0)?
+                src_f16(0, f.opsel & 1 != 0, true)? | src_f16(1, f.opsel & 2 != 0, true)?
             }
-            "v_mov_b32" => src_f16(0, hi)?,
-            "v_cndmask_b32" => src_f16(0, hi)? & src_f16(1, hi)?,
+            "v_mov_b32" => src_f16(0, hi, false)?,
+            "v_cndmask_b32" => src_f16(0, hi, false)? & src_f16(1, hi, false)?,
             "v_pack_b32_f16" => {
                 let k = usize::from(hi);
-                src_f16(k, f.opsel >> k & 1 != 0)?
+                src_f16(k, f.opsel >> k & 1 != 0, true)?
             }
             "v_cvt_pkrtz_f16_f32" => src_f32(usize::from(hi))?,
             "v_lshl_or_b32" if matches!(f.src.get(1), Some(Operand::Const(144))) => {
-                // `v_lshl_or_b32 dst, hi_half, 16, lo_half` (inline 16 = 128 + 16 = 144).
+                // `v_lshl_or_b32 dst, src0, 16, src2` (inline 16 = 128 + 16 = 144):
+                // low half is `src2[15:0]`; high half is `src0[15:0] | src2[31:16]`,
+                // so proving the high half whole requires `src2[31:16] == 0` (or
+                // evaluating both constants together).
                 if hi {
-                    src_f16(0, false)?
+                    if let (Some(c0), Some(c2)) = (const_u32(0), const_u32(2)) {
+                        f16_whole((c0 << 16) | c2, true)?
+                    } else if self.high16_zero_op(inst, f.src.get(2)?, &mut HashSet::new()) {
+                        src_f16(0, false, false)?
+                    } else {
+                        return None;
+                    }
                 } else {
-                    src_f16(2, false)?
+                    src_f16(2, false, false)?
                 }
             }
             _ => return None,
         };
         Some(r && never_nan)
+    }
+
+    /// Whether bits `[31:16]` of operand `op` are provably zero in every lane.
+    fn high16_zero_op(&self, inst: &Inst, op: &Operand, seen: &mut HashSet<Value>) -> bool {
+        match *op {
+            Operand::Const(c) => crate::resource::inline(c).is_some_and(|x| x >> 16 == 0),
+            Operand::Literal(x) => x >> 16 == 0,
+            Operand::Vector { reg, .. } => inst
+                .read(Reg::V(reg))
+                .is_some_and(|v| self.high16_zero(v, seen)),
+            Operand::Scalar { code, .. } if code != NULL => inst
+                .read(Reg::S(code))
+                .is_some_and(|v| self.high16_zero(v, seen)),
+            Operand::Scalar { .. } => true,
+            _ => false,
+        }
+    }
+
+    /// Whether bits `[31:16]` of SSA value `v` are provably zero in every lane.
+    fn high16_zero(&self, v: Value, seen: &mut HashSet<Value>) -> bool {
+        if !seen.insert(v) {
+            return true;
+        }
+        let p = self.x.p;
+        if let Some(&(b, i)) = self.phi_at.get(&v) {
+            return p.blocks[b].phis[i]
+                .args
+                .iter()
+                .all(|&arg| self.high16_zero(arg, seen));
+        }
+        let Some(&b) = self.def_block.get(&v) else {
+            return false;
+        };
+        let Some((i, inst)) = p.blocks[b]
+            .insts
+            .iter()
+            .enumerate()
+            .find(|(_, i)| i.writes.iter().any(|w| w.1 == v))
+        else {
+            return false;
+        };
+        let const_u32 = |op: Option<&Operand>| -> Option<u32> {
+            match *op? {
+                Operand::Const(c) => crate::resource::inline(c),
+                Operand::Literal(x) => Some(x),
+                _ => None,
+            }
+        };
+        match &inst.fields {
+            Fields::Valu(f) => {
+                if f.omod != 0 || f.abs != 0 || f.neg != 0 || f.clamp || f.sdwa.is_some() || f.dpp.is_some() {
+                    return false;
+                }
+                if self.x.st.guards[b][i].is_some() {
+                    let Some(Operand::Vector { reg, .. }) = f.dst else {
+                        return false;
+                    };
+                    let Some(old) = inst.read(Reg::V(reg)) else {
+                        return false;
+                    };
+                    if !self.high16_zero(old, seen) {
+                        return false;
+                    }
+                }
+                match inst.name() {
+                    "v_mov_b32" => f.src.first().is_some_and(|op| self.high16_zero_op(inst, op, seen)),
+                    "v_and_b32" | "v_min_u32" => f
+                        .src
+                        .iter()
+                        .take(2)
+                        .any(|op| self.high16_zero_op(inst, op, seen)),
+                    "v_or_b32" | "v_xor_b32" | "v_cndmask_b32" => {
+                        f.src.len() >= 2
+                            && f.src
+                                .iter()
+                                .take(2)
+                                .all(|op| self.high16_zero_op(inst, op, seen))
+                    }
+                    "v_and_or_b32" => {
+                        f.src.len() >= 3
+                            && f.src
+                                .iter()
+                                .take(2)
+                                .any(|op| self.high16_zero_op(inst, op, seen))
+                            && self.high16_zero_op(inst, &f.src[2], seen)
+                    }
+                    "v_lshrrev_b32" => {
+                        const_u32(f.src.first()).is_some_and(|s| (s & 31) >= 16)
+                            || f.src.get(1).is_some_and(|op| self.high16_zero_op(inst, op, seen))
+                    }
+                    "v_bfe_u32" => const_u32(f.src.get(2)).is_some_and(|w| (w & 31) <= 16),
+                    _ => false,
+                }
+            }
+            Fields::Sop { src, .. } => match inst.name() {
+                "s_mov_b32" => src.first().is_some_and(|op| self.high16_zero_op(inst, op, seen)),
+                "s_and_b32" | "s_min_u32" => src
+                    .iter()
+                    .take(2)
+                    .any(|op| self.high16_zero_op(inst, op, seen)),
+                "s_or_b32" | "s_xor_b32" | "s_cselect_b32" => {
+                    src.len() >= 2
+                        && src
+                            .iter()
+                            .take(2)
+                            .all(|op| self.high16_zero_op(inst, op, seen))
+                }
+                "s_lshr_b32" => {
+                    const_u32(src.get(1)).is_some_and(|s| (s & 31) >= 16)
+                        || src.first().is_some_and(|op| self.high16_zero_op(inst, op, seen))
+                }
+                "s_bfe_u32" => const_u32(src.get(1)).is_some_and(|spec| ((spec >> 16) & 0x7F) <= 16),
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     /// Whether `v` holds, as a float, a whole number or an infinity in
