@@ -13,6 +13,8 @@ use crate::native::{
 };
 use crate::{io, ir, resource, structure};
 
+mod runtime_sampler;
+
 /// Per lane (32, wave32): the record [offset word, u, v, level] at entry 1
 /// of the table at s0 (a 2D texture at entry 0, a raw UAV at entry 2); the
 /// level converted from an integer (so it is whole). Gathers red at the
@@ -102,7 +104,11 @@ fn build_with_threads(words: &[u32], threads: u32) -> Result<HostShader, crate::
         }),
         code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
     };
-    let lowered = lowered(&native)?;
+    build_native(&native)
+}
+
+fn build_native(native: &NativeProgram) -> Result<HostShader, crate::ShaderError> {
+    let lowered = lowered(native)?;
     Ok(HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
