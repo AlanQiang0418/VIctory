@@ -1341,6 +1341,16 @@ impl Host {
         pso: &ID3D12PipelineState,
         d: &Dispatch,
     ) -> Result<Vec<Vec<u32>>, String> {
+        self.dispatch_with_sampler_heap(root, pso, d, None)
+    }
+
+    pub(super) fn dispatch_with_sampler_heap(
+        &self,
+        root: &ID3D12RootSignature,
+        pso: &ID3D12PipelineState,
+        d: &Dispatch,
+        sampler_heap: Option<&ID3D12DescriptorHeap>,
+    ) -> Result<Vec<Vec<u32>>, String> {
         let dev = &self.device;
         // SAFETY: D3D12 calls with descriptions that outlive them; resources
         // stay alive until the fence says the GPU is done.
@@ -1456,7 +1466,16 @@ impl Host {
                 _ => d.views.len(),
             };
             let views = heap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, slots)?;
-            let samplers = heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, d.samplers.len())?;
+            let samplers = match sampler_heap {
+                Some(h) => {
+                    let desc = h.GetDesc();
+                    assert_eq!(desc.Type, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+                    assert_eq!(desc.Flags, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
+                    assert!(d.samplers.len() <= desc.NumDescriptors as usize);
+                    h.clone()
+                }
+                None => heap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, d.samplers.len())?,
+            };
             let view_size = dev
                 .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
                 as usize;
