@@ -1384,26 +1384,29 @@ fn fit_format(
         format.0 = linear as i32;
     }
     let view = format.as_ref().map_or(0, |f| f.0 as u32);
-    if view == 0 {
-        return (!typeless && (!unordered || typed_store(own))).then_some(d.Format);
-    }
-    if DEPTH_FORMATS.iter().any(|&(typed, _)| typed == view) || is_typeless(view) {
-        once!(unordered, view, own, "view the host does not allow");
+    if view == 0 && typeless {
         return None;
     }
     let cast = castable.contains(&view);
-    if family(view) != family(own) && !cast {
-        once!(view, own, "view format of another family");
-        return None;
-    }
     // A typed UAV must store in the format the host will actually use.
-    let effective = if typeless || cast { view } else { own };
+    let effective = if view == 0 || (!typeless && !cast) { own } else { view };
     if unordered && !typed_store(effective) {
         once!(
             view = effective,
             own,
             "an unordered view in a format the host cannot store"
         );
+        return None;
+    }
+    if view == 0 {
+        return Some(d.Format);
+    }
+    if DEPTH_FORMATS.iter().any(|&(typed, _)| typed == view) || is_typeless(view) {
+        once!(unordered, view, own, "view the host does not allow");
+        return None;
+    }
+    if family(view) != family(own) && !cast {
+        once!(view, own, "view format of another family");
         return None;
     }
     let actual = DXGI_FORMAT(effective as i32);
