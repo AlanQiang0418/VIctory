@@ -8671,9 +8671,14 @@ impl<'a> Lower<'a> {
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
-        let mut texel = op == 66 || op == 73;
-        let mut point_choice = None;
-        let r = if sample {
+        let channels: Vec<u32> = if op == 73 {
+            vec![0, 1, 2, 3]
+        } else {
+            (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
+        };
+        let mut xs = if sample {
+            let mut texel = op == 73;
+            let mut point_choice = None;
             let ss = self
                 .descriptors
                 .get(&(site, true))
@@ -8810,7 +8815,7 @@ impl<'a> Lower<'a> {
             }
             let mut args = vec![h, sh];
             args.extend(&cs);
-            match op {
+            let r = match op {
                 60 => {
                     if offset_word {
                         // DXIL takes immediate offsets in -8..=7; the
@@ -8993,6 +8998,12 @@ impl<'a> Lower<'a> {
                         &args,
                     )
                 }
+            };
+            let values: Vec<_> = channels.iter().map(|&ch| self.s.m.extract(c, r, ch)).collect();
+            if *d16 {
+                self.image_d16(h, &values, texel, point_choice)?
+            } else {
+                values.into_iter().map(|x| self.as_int(x)).collect()
             }
         } else {
             let mut cs = vec![iu; 3];
@@ -9011,32 +9022,28 @@ impl<'a> Lower<'a> {
             let mut args = vec![h, mip];
             args.extend(&cs);
             args.extend([iu, iu, iu]);
-            self.s.op(
-                c,
-                "textureLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                66,
-                &args,
-            )
+            if *d16 {
+                self.image_load_d16(h, props.0, &mut args, &channels)?
+            } else {
+                let r = self.s.op(
+                    c,
+                    "textureLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    66,
+                    &args,
+                );
+                channels
+                    .iter()
+                    .map(|&ch| {
+                        let x = self.s.m.extract(c, r, ch);
+                        self.as_int(x)
+                    })
+                    .collect()
+            }
         };
         let Operand::Vector { reg, .. } = *data else {
             return Err("an image result");
-        };
-        let channels: Vec<u32> = if op == 73 {
-            vec![0, 1, 2, 3]
-        } else {
-            (0..4).filter(|ch| dmask >> ch & 1 != 0).collect()
-        };
-        let channels: Vec<_> = channels
-            .into_iter()
-            .map(|ch| self.s.m.extract(c, r, ch))
-            .collect();
-        // shortcut: integer image formats would keep 16 integer bits.
-        let mut xs = if *d16 {
-            self.image_d16(h, &channels, texel, point_choice)?
-        } else {
-            channels.into_iter().map(|x| self.as_int(x)).collect()
         };
         if *d16 {
             // Two channels per VGPR, low half first (an odd last high half 0).

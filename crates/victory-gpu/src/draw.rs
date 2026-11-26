@@ -2730,10 +2730,11 @@ uint ps() : SV_Target { return 1; }
     }
 
     #[test]
-    fn texture_rounding_follows_the_view_in_a_reused_heap_slot() {
-        use victory_shader::emit::host::texture_rounding;
+    fn texture_format_follows_the_view_in_a_reused_heap_slot() {
+        use victory_shader::emit::host::texture_view_tag;
         use windows::Win32::Graphics::Dxgi::Common::{
-            DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32G32B32A32_FLOAT,
+            DXGI_FORMAT_R8G8B8A8_SINT, DXGI_FORMAT_R8G8B8A8_UINT, DXGI_FORMAT_R8G8B8A8_UNORM,
+            DXGI_FORMAT_R32G32B32A32_FLOAT,
         };
 
         let Some(heap) = crate::descriptor::host::HostHeap::new(false, 4) else {
@@ -2755,9 +2756,13 @@ uint ps() : SV_Target { return 1; }
             )
         };
         heap.make_at(slot, &View::Shader(texture(unorm) as usize, None));
-        let want = texture_rounding(unorm);
+        let want = texture_view_tag(unorm);
         assert_ne!(want, 0);
         assert_eq!(entry(), want);
+        for format in [DXGI_FORMAT_R8G8B8A8_UINT, DXGI_FORMAT_R8G8B8A8_SINT] {
+            heap.make_at(slot, &View::Shader(texture(format) as usize, None));
+            assert_eq!(entry(), texture_view_tag(format));
+        }
         heap.make_at(slot, &View::Shader(texture(float) as usize, None));
         assert_eq!(entry(), 0);
         let placed = placed_view(

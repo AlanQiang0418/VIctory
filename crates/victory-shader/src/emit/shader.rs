@@ -14,7 +14,7 @@ pub const SAMPLER_SPACE: u32 = 0;
 pub const ROOT_CBV_SPACE: u32 = 1;
 /// The root SRV slot (`t255` in [`ROOT_CBV_SPACE`], past every title root
 /// parameter) of a table with the buffer stride and integer kind or the
-/// texture rounding tag at each view-heap index.
+/// texture format tag at each view-heap index.
 pub const VIEW_STRIDES: u8 = 255;
 /// The bits of a view-table dword holding the buffer stride.
 pub const VIEW_STRIDE_BITS: u32 = (1 << 27) - 1;
@@ -22,6 +22,9 @@ pub const VIEW_STRIDE_BITS: u32 = (1 << 27) - 1;
 pub(super) const VIEW_NORMALIZED: u32 = 1 << 29;
 pub(super) const VIEW_UNORM16: u32 = VIEW_NORMALIZED | 1 << 28;
 pub(super) const VIEW_SNORM16: u32 = VIEW_UNORM16 | 1 << 27;
+pub(super) const VIEW_UINT: u32 = 1 << 28;
+pub(super) const VIEW_SINT: u32 = VIEW_UINT | 1 << 27;
+pub(super) const VIEW_TEXTURE_MASK: u32 = VIEW_SNORM16;
 /// A typed buffer view of an integer format, whose D16 accesses pass bits.
 pub const VIEW_INTEGER: u32 = 1 << 31;
 /// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
